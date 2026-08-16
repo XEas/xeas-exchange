@@ -6,6 +6,10 @@
 #include <cstdint>
 #include <type_traits>
 
+#include <string>
+#include <string_view>
+#include <vector>
+
 namespace {
 
 using namespace xeas;
@@ -45,6 +49,125 @@ TEST(Skeleton, BookDefaultConstructs) {
     Book book;
     (void)book;
     SUCCEED();
+}
+
+// ---------------------------------------------------------------------------
+// Test helpers: event factories
+// ---------------------------------------------------------------------------
+
+Event make_add(OrderId id, Side side, Price price, Qty qty, Timestamp ts = 0) {
+    Event e;
+    e.type = EventType::Add;
+    e.timestamp = ts;
+    e.order_id = id;
+    e.side = side;
+    e.price = price;
+    e.quantity = qty;
+    return e;
+}
+
+}  // namespace
+
+namespace xeas {
+
+// Test-only backdoor (friend of Book) used to observe FIFO queue order and,
+// from Task 3 on, to corrupt internal state so the invariant checker can be
+// genuinely tested. Never used by production code.
+struct BookTestPeer {
+    static std::vector<OrderId> level_order_ids(const Book& b, Side side, Price price) {
+        std::vector<OrderId> ids;
+        const Book::Level* level = nullptr;
+        if (side == Side::Bid) {
+            const auto it = b.bids_.find(price);
+            if (it != b.bids_.end()) level = &it->second;
+        } else {
+            const auto it = b.asks_.find(price);
+            if (it != b.asks_.end()) level = &it->second;
+        }
+        if (level != nullptr) {
+            for (const auto& order : level->orders) ids.push_back(order.id);
+        }
+        return ids;
+    }
+};
+
+}  // namespace xeas
+
+namespace {
+
+using xeas::BookTestPeer;
+
+// ---------------------------------------------------------------------------
+// Task 2: Add + queries
+// ---------------------------------------------------------------------------
+
+TEST(AddAndQueries, EmptyBookQueries) {
+    Book book;
+    EXPECT_FALSE(book.best_bid().has_value());
+    EXPECT_FALSE(book.best_ask().has_value());
+    EXPECT_EQ(book.size_at(Side::Bid, 1'000'000), 0);
+    EXPECT_EQ(book.size_at(Side::Ask, 1'000'000), 0);
+    EXPECT_FALSE(book.find_order(1).has_value());
+    EXPECT_EQ(book.order_count(), 0u);
+    EXPECT_EQ(book.level_count(Side::Bid), 0u);
+    EXPECT_EQ(book.level_count(Side::Ask), 0u);
+}
+
+TEST(AddAndQueries, SingleBidAdd) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+
+    const auto bb = book.best_bid();
+    ASSERT_TRUE(bb.has_value());
+    EXPECT_EQ(bb->price, 1'000'000);
+    EXPECT_EQ(bb->total_shares, 100);
+    EXPECT_FALSE(book.best_ask().has_value());
+    EXPECT_EQ(book.size_at(Side::Bid, 1'000'000), 100);
+    EXPECT_EQ(book.size_at(Side::Bid, 999'999), 0);
+
+    const auto info = book.find_order(1);
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->side, Side::Bid);
+    EXPECT_EQ(info->price, 1'000'000);
+    EXPECT_EQ(info->remaining_qty, 100u);
+
+    EXPECT_EQ(book.order_count(), 1u);
+    EXPECT_EQ(book.level_count(Side::Bid), 1u);
+    EXPECT_EQ(book.level_count(Side::Ask), 0u);
+}
+
+TEST(AddAndQueries, AggregatesLevelsAndBestPriceOrdering) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_add(2, Side::Bid, 1'000'000, 50));  // same level: aggregates
+    apply(book, make_add(3, Side::Bid, 990'000, 25));    // worse bid (lower)
+    apply(book, make_add(4, Side::Ask, 1'010'000, 75));
+    apply(book, make_add(5, Side::Ask, 1'020'000, 10));  // worse ask (higher)
+
+    const auto bb = book.best_bid();
+    ASSERT_TRUE(bb.has_value());
+    EXPECT_EQ(bb->price, 1'000'000);  // highest bid is best
+    EXPECT_EQ(bb->total_shares, 150);
+
+    const auto ba = book.best_ask();
+    ASSERT_TRUE(ba.has_value());
+    EXPECT_EQ(ba->price, 1'010'000);  // lowest ask is best
+    EXPECT_EQ(ba->total_shares, 75);
+
+    EXPECT_EQ(book.size_at(Side::Bid, 990'000), 25);
+    EXPECT_EQ(book.size_at(Side::Ask, 1'020'000), 10);
+    EXPECT_EQ(book.order_count(), 5u);
+    EXPECT_EQ(book.level_count(Side::Bid), 2u);
+    EXPECT_EQ(book.level_count(Side::Ask), 2u);
+}
+
+TEST(AddAndQueries, TimePriorityFifoEnqueueAtBack) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'010'000, 10));
+    apply(book, make_add(2, Side::Ask, 1'010'000, 20));
+    apply(book, make_add(3, Side::Ask, 1'010'000, 30));
+    EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Ask, 1'010'000),
+              (std::vector<OrderId>{1, 2, 3}));
 }
 
 }  // namespace
