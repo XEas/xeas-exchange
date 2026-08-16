@@ -644,4 +644,136 @@ TEST(ErrorPolicy, BookErrorCarriesOffendingEventAndReason) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Task 8: event-tape scenarios — queries AND consistency after EVERY event
+// ---------------------------------------------------------------------------
+
+// Applies the event and asserts full-book consistency at the call site
+// (a macro so ASSERT aborts the enclosing TEST, not a helper function).
+#define APPLY_CHECKED(book, event)                \
+    do {                                          \
+        apply((book), (event));                   \
+        ASSERT_TRUE(book_consistent((book)));     \
+    } while (0)
+
+TEST(EventTapes, AddCancelDeleteLifecycle) {
+    Book book;
+
+    APPLY_CHECKED(book, make_add(1, Side::Bid, 1'000'000, 100, 1));
+    EXPECT_EQ(book.best_bid()->price, 1'000'000);
+    EXPECT_EQ(book.order_count(), 1u);
+
+    APPLY_CHECKED(book, make_add(2, Side::Ask, 1'010'000, 80, 2));
+    EXPECT_EQ(book.best_ask()->price, 1'010'000);
+    EXPECT_EQ(book.best_ask()->total_shares, 80);
+
+    APPLY_CHECKED(book, make_cancel(1, 25, 3));
+    EXPECT_EQ(book.find_order(1)->remaining_qty, 75u);
+    EXPECT_EQ(book.best_bid()->total_shares, 75);
+
+    APPLY_CHECKED(book, make_execute(2, 30, 4));
+    EXPECT_EQ(book.find_order(2)->remaining_qty, 50u);
+    EXPECT_EQ(book.best_ask()->total_shares, 50);
+
+    APPLY_CHECKED(book, make_delete(1, 5));
+    EXPECT_FALSE(book.best_bid().has_value());
+    EXPECT_EQ(book.level_count(Side::Bid), 0u);
+
+    APPLY_CHECKED(book, make_execute(2, 50, 6));
+    EXPECT_FALSE(book.best_ask().has_value());
+    EXPECT_EQ(book.order_count(), 0u);
+    EXPECT_EQ(book.level_count(Side::Ask), 0u);
+}
+
+TEST(EventTapes, PartialExecutesSweepLevelInFifoOrder) {
+    Book book;
+
+    APPLY_CHECKED(book, make_add(1, Side::Ask, 1'010'000, 100, 1));
+    APPLY_CHECKED(book, make_add(2, Side::Ask, 1'010'000, 50, 2));
+    EXPECT_EQ(book.size_at(Side::Ask, 1'010'000), 150);
+    EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Ask, 1'010'000),
+              (std::vector<OrderId>{1, 2}));
+
+    APPLY_CHECKED(book, make_execute(1, 40, 3));
+    EXPECT_EQ(book.find_order(1)->remaining_qty, 60u);
+    EXPECT_EQ(book.size_at(Side::Ask, 1'010'000), 110);
+
+    APPLY_CHECKED(book, make_execute(1, 60, 4));
+    EXPECT_FALSE(book.find_order(1).has_value());
+    EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Ask, 1'010'000),
+              (std::vector<OrderId>{2}));
+    EXPECT_EQ(book.size_at(Side::Ask, 1'010'000), 50);
+
+    APPLY_CHECKED(book, make_execute(2, 50, 5));
+    EXPECT_EQ(book.level_count(Side::Ask), 0u);
+    EXPECT_FALSE(book.best_ask().has_value());
+    EXPECT_EQ(book.order_count(), 0u);
+}
+
+TEST(EventTapes, ReplacePriceMoveAndPriorityLoss) {
+    Book book;
+
+    APPLY_CHECKED(book, make_add(1, Side::Bid, 1'000'000, 100, 1));
+    APPLY_CHECKED(book, make_add(2, Side::Bid, 1'000'000, 50, 2));
+    APPLY_CHECKED(book, make_add(3, Side::Bid, 990'000, 30, 3));
+    EXPECT_EQ(book.best_bid()->price, 1'000'000);
+    EXPECT_EQ(book.best_bid()->total_shares, 150);
+
+    // Price move down: order 1 leaves the best level, joins 990'000 at the back.
+    APPLY_CHECKED(book, make_replace(1, 4, 990'000, 100, 4));
+    EXPECT_EQ(book.size_at(Side::Bid, 1'000'000), 50);
+    EXPECT_EQ(book.size_at(Side::Bid, 990'000), 130);
+    EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Bid, 990'000),
+              (std::vector<OrderId>{3, 4}));
+    EXPECT_EQ(book.best_bid()->price, 1'000'000);
+
+    // Replacing the last order at the best level removes that level; BBO falls.
+    APPLY_CHECKED(book, make_replace(2, 5, 990'000, 25, 5));
+    EXPECT_EQ(book.size_at(Side::Bid, 1'000'000), 0);
+    EXPECT_EQ(book.level_count(Side::Bid), 1u);
+    EXPECT_EQ(book.best_bid()->price, 990'000);
+    EXPECT_EQ(book.best_bid()->total_shares, 155);
+    EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Bid, 990'000),
+              (std::vector<OrderId>{3, 4, 5}));
+    EXPECT_EQ(book.order_count(), 3u);
+}
+
+TEST(EventTapes, LevelChurnAndBboUpdatesBothSides) {
+    Book book;
+
+    APPLY_CHECKED(book, make_add(1, Side::Bid, 990'000, 10, 1));
+    EXPECT_EQ(book.best_bid()->price, 990'000);
+
+    APPLY_CHECKED(book, make_add(2, Side::Bid, 1'000'000, 20, 2));
+    EXPECT_EQ(book.best_bid()->price, 1'000'000);  // better bid becomes BBO
+    EXPECT_EQ(book.level_count(Side::Bid), 2u);
+
+    APPLY_CHECKED(book, make_add(3, Side::Ask, 1'020'000, 30, 3));
+    EXPECT_EQ(book.best_ask()->price, 1'020'000);
+
+    APPLY_CHECKED(book, make_add(4, Side::Ask, 1'010'000, 40, 4));
+    EXPECT_EQ(book.best_ask()->price, 1'010'000);  // better ask becomes BBO
+    EXPECT_EQ(book.level_count(Side::Ask), 2u);
+
+    APPLY_CHECKED(book, make_delete(2, 5));
+    EXPECT_EQ(book.best_bid()->price, 990'000);  // BBO falls back
+    EXPECT_EQ(book.level_count(Side::Bid), 1u);
+
+    APPLY_CHECKED(book, make_execute(4, 40, 6));
+    EXPECT_EQ(book.best_ask()->price, 1'020'000);  // BBO rises back
+    EXPECT_EQ(book.level_count(Side::Ask), 1u);
+
+    APPLY_CHECKED(book, make_cancel(3, 5, 7));
+    EXPECT_EQ(book.best_ask()->total_shares, 25);
+
+    APPLY_CHECKED(book, make_delete(3, 8));
+    EXPECT_FALSE(book.best_ask().has_value());
+
+    APPLY_CHECKED(book, make_delete(1, 9));
+    EXPECT_FALSE(book.best_bid().has_value());
+    EXPECT_EQ(book.order_count(), 0u);
+    EXPECT_EQ(book.level_count(Side::Bid), 0u);
+    EXPECT_EQ(book.level_count(Side::Ask), 0u);
+}
+
 }  // namespace
