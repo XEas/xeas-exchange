@@ -102,8 +102,16 @@ void apply(Book& book, const Event& event) {
         book.erase_order(index_it);
         break;
     }
-    case EventType::Replace:
-        break;  // implemented in Task 6
+    case EventType::Replace: {
+        // Atomic remove + insert on the SAME side (resolved from the replaced
+        // order, never from event.side), at the BACK of the (possibly new)
+        // level's queue — time priority is lost (ITCH semantics).
+        const auto index_it = book.orders_.find(event.order_id);
+        const Side side = index_it->second.side;
+        book.erase_order(index_it);
+        book.insert_order(side, event.price, event.new_order_id, event.quantity);
+        break;
+    }
     }
 }
 

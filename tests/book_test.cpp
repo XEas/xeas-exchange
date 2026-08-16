@@ -462,4 +462,76 @@ TEST(DeleteEvent, DeleteLastOrderRemovesLevelAndUpdatesBbo) {
     EXPECT_TRUE(book_consistent(book));
 }
 
+// ---------------------------------------------------------------------------
+// Task 6: Replace
+// ---------------------------------------------------------------------------
+
+Event make_replace(OrderId id, OrderId new_id, Price price, Qty qty, Timestamp ts = 0) {
+    Event e;
+    e.type = EventType::Replace;
+    e.timestamp = ts;
+    e.order_id = id;
+    // Deliberately leaves e.side at its default: the book must resolve the
+    // side from the replaced order, never from the event.
+    e.price = price;
+    e.quantity = qty;
+    e.new_order_id = new_id;
+    return e;
+}
+
+TEST(ReplaceEvent, SamePriceLosesTimePriority) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'010'000, 100));
+    apply(book, make_add(2, Side::Ask, 1'010'000, 50));
+    apply(book, make_replace(1, 10, 1'010'000, 100));  // same price, same qty
+
+    EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Ask, 1'010'000),
+              (std::vector<OrderId>{2, 10}));  // re-enqueued at the back
+    EXPECT_EQ(book.size_at(Side::Ask, 1'010'000), 150);
+    EXPECT_TRUE(book_consistent(book));
+}
+
+TEST(ReplaceEvent, PriceMoveCreatesAndRemovesLevels) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));  // alone at its level
+    apply(book, make_add(2, Side::Bid, 990'000, 25));
+    apply(book, make_replace(1, 10, 980'000, 40));
+
+    EXPECT_EQ(book.size_at(Side::Bid, 1'000'000), 0);  // old level removed
+    EXPECT_EQ(book.size_at(Side::Bid, 980'000), 40);   // new level created
+    const auto bb = book.best_bid();
+    ASSERT_TRUE(bb.has_value());
+    EXPECT_EQ(bb->price, 990'000);
+    EXPECT_EQ(book.level_count(Side::Bid), 2u);
+    EXPECT_TRUE(book_consistent(book));
+}
+
+TEST(ReplaceEvent, KeepsSideFromBookNotEvent) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'010'000, 100));
+    // make_replace leaves event.side == Side::Bid (default); the book must
+    // still keep the order on the Ask side.
+    apply(book, make_replace(1, 10, 1'020'000, 60));
+
+    const auto info = book.find_order(10);
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->side, Side::Ask);
+    EXPECT_EQ(info->price, 1'020'000);
+    EXPECT_EQ(info->remaining_qty, 60u);  // event quantity, not carried over
+    EXPECT_EQ(book.level_count(Side::Bid), 0u);
+    EXPECT_TRUE(book_consistent(book));
+}
+
+TEST(ReplaceEvent, OldIdGoneNewIdPresentCountsStable) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_replace(1, 2, 1'000'000, 70));
+
+    EXPECT_FALSE(book.find_order(1).has_value());
+    ASSERT_TRUE(book.find_order(2).has_value());
+    EXPECT_EQ(book.order_count(), 1u);
+    EXPECT_EQ(book.size_at(Side::Bid, 1'000'000), 70);
+    EXPECT_TRUE(book_consistent(book));
+}
+
 }  // namespace
