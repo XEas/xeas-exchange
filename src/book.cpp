@@ -95,8 +95,13 @@ void apply(Book& book, const Event& event) {
         }
         break;
     }
-    case EventType::Delete:
-        break;  // implemented in Task 5
+    case EventType::Delete: {
+        // Remove entirely, whatever the remaining quantity; event.quantity and
+        // event.price are ignored by definition (spec section 2).
+        const auto index_it = book.orders_.find(event.order_id);
+        book.erase_order(index_it);
+        break;
+    }
     case EventType::Replace:
         break;  // implemented in Task 6
     }

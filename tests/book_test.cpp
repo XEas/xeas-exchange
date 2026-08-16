@@ -407,4 +407,59 @@ TEST(CancelExecute, PartialThenFullExecuteRemovesFrontOrder) {
     EXPECT_TRUE(book_consistent(book));
 }
 
+// ---------------------------------------------------------------------------
+// Task 5: Delete
+// ---------------------------------------------------------------------------
+
+Event make_delete(OrderId id, Timestamp ts = 0) {
+    Event e;
+    e.type = EventType::Delete;
+    e.timestamp = ts;
+    e.order_id = id;
+    return e;
+}
+
+TEST(DeleteEvent, DeleteRemovesOrderWithRemainingShares) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_add(2, Side::Bid, 1'000'000, 50));
+    apply(book, make_delete(1));  // 100 shares still remaining: removed anyway
+
+    EXPECT_FALSE(book.find_order(1).has_value());
+    EXPECT_EQ(book.size_at(Side::Bid, 1'000'000), 50);
+    EXPECT_EQ(book.order_count(), 1u);
+    EXPECT_TRUE(book_consistent(book));
+}
+
+TEST(DeleteEvent, DeleteIgnoresQuantityAndPrice) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'010'000, 100));
+
+    Event e;
+    e.type = EventType::Delete;
+    e.order_id = 1;
+    e.quantity = 999'999;  // ignored
+    e.price = -5;          // ignored (price validation applies to Add/Replace only)
+    apply(book, e);
+
+    EXPECT_FALSE(book.find_order(1).has_value());
+    EXPECT_EQ(book.order_count(), 0u);
+    EXPECT_TRUE(book_consistent(book));
+}
+
+TEST(DeleteEvent, DeleteLastOrderRemovesLevelAndUpdatesBbo) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_add(2, Side::Bid, 990'000, 25));
+    apply(book, make_delete(1));
+
+    const auto bb = book.best_bid();
+    ASSERT_TRUE(bb.has_value());
+    EXPECT_EQ(bb->price, 990'000);  // BBO fell to the next level
+    EXPECT_EQ(bb->total_shares, 25);
+    EXPECT_EQ(book.level_count(Side::Bid), 1u);
+    EXPECT_EQ(book.size_at(Side::Bid, 1'000'000), 0);
+    EXPECT_TRUE(book_consistent(book));
+}
+
 }  // namespace
