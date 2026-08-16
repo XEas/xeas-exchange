@@ -294,4 +294,117 @@ TEST(Invariants, IndexHandleDisagreementIsFlagged) {
     EXPECT_TRUE(any_contains(check_invariants(book), "disagrees"));
 }
 
+// ---------------------------------------------------------------------------
+// Task 4: Cancel + Execute
+// ---------------------------------------------------------------------------
+
+Event make_cancel(OrderId id, Qty qty, Timestamp ts = 0) {
+    Event e;
+    e.type = EventType::Cancel;
+    e.timestamp = ts;
+    e.order_id = id;
+    e.quantity = qty;
+    return e;
+}
+
+Event make_execute(OrderId id, Qty qty, Timestamp ts = 0) {
+    Event e;
+    e.type = EventType::Execute;
+    e.timestamp = ts;
+    e.order_id = id;
+    e.quantity = qty;
+    return e;
+}
+
+TEST(CancelExecute, PartialCancelReducesOrderAndLevel) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_cancel(1, 30));
+
+    const auto info = book.find_order(1);
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->remaining_qty, 70u);
+    EXPECT_EQ(book.size_at(Side::Bid, 1'000'000), 70);
+    EXPECT_EQ(book.order_count(), 1u);
+    EXPECT_EQ(book.level_count(Side::Bid), 1u);
+    EXPECT_TRUE(book_consistent(book));
+}
+
+TEST(CancelExecute, FullCancelRemovesOrderKeepsLevelWithOthers) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_add(2, Side::Bid, 1'000'000, 50));
+    apply(book, make_cancel(1, 100));  // reaches zero: removed immediately
+
+    EXPECT_FALSE(book.find_order(1).has_value());
+    EXPECT_EQ(book.size_at(Side::Bid, 1'000'000), 50);
+    EXPECT_EQ(book.order_count(), 1u);
+    EXPECT_EQ(book.level_count(Side::Bid), 1u);
+    EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Bid, 1'000'000),
+              (std::vector<OrderId>{2}));
+    EXPECT_TRUE(book_consistent(book));
+}
+
+TEST(CancelExecute, CancelLastOrderRemovesLevel) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'010'000, 100));
+    apply(book, make_cancel(1, 100));
+
+    EXPECT_FALSE(book.best_ask().has_value());
+    EXPECT_EQ(book.level_count(Side::Ask), 0u);  // no empty levels ever
+    EXPECT_EQ(book.size_at(Side::Ask, 1'010'000), 0);
+    EXPECT_EQ(book.order_count(), 0u);
+    EXPECT_TRUE(book_consistent(book));
+}
+
+TEST(CancelExecute, MidQueueRemovalPreservesFifoOfOthers) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'010'000, 10));
+    apply(book, make_add(2, Side::Ask, 1'010'000, 20));
+    apply(book, make_add(3, Side::Ask, 1'010'000, 30));
+    apply(book, make_cancel(2, 20));
+
+    EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Ask, 1'010'000),
+              (std::vector<OrderId>{1, 3}));
+    EXPECT_EQ(book.size_at(Side::Ask, 1'010'000), 40);
+    EXPECT_TRUE(book_consistent(book));
+}
+
+TEST(CancelExecute, ExecuteHasSameBookEffectAsCancel) {
+    Book cancel_book;
+    Book exec_book;
+    for (Book* b : {&cancel_book, &exec_book}) {
+        apply(*b, make_add(1, Side::Ask, 1'010'000, 100));
+        apply(*b, make_add(2, Side::Ask, 1'010'000, 50));
+    }
+    apply(cancel_book, make_cancel(1, 40));
+    apply(exec_book, make_execute(1, 40));  // execution price never affects book state
+
+    EXPECT_EQ(cancel_book.size_at(Side::Ask, 1'010'000),
+              exec_book.size_at(Side::Ask, 1'010'000));
+    EXPECT_EQ(cancel_book.find_order(1)->remaining_qty,
+              exec_book.find_order(1)->remaining_qty);
+    EXPECT_EQ(cancel_book.order_count(), exec_book.order_count());
+    EXPECT_EQ(cancel_book.level_count(Side::Ask), exec_book.level_count(Side::Ask));
+    EXPECT_TRUE(book_consistent(exec_book));
+}
+
+TEST(CancelExecute, PartialThenFullExecuteRemovesFrontOrder) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'010'000, 100));
+    apply(book, make_add(2, Side::Ask, 1'010'000, 50));
+
+    apply(book, make_execute(1, 40));
+    EXPECT_EQ(book.find_order(1)->remaining_qty, 60u);
+    EXPECT_EQ(book.size_at(Side::Ask, 1'010'000), 110);
+    EXPECT_TRUE(book_consistent(book));
+
+    apply(book, make_execute(1, 60));
+    EXPECT_FALSE(book.find_order(1).has_value());
+    EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Ask, 1'010'000),
+              (std::vector<OrderId>{2}));
+    EXPECT_EQ(book.size_at(Side::Ask, 1'010'000), 50);
+    EXPECT_TRUE(book_consistent(book));
+}
+
 }  // namespace

@@ -58,6 +58,21 @@ void Book::insert_order(Side side, Price price, OrderId order_id, Qty quantity) 
     orders_.emplace(order_id, OrderHandle{side, price, &level, pos});
 }
 
+void Book::erase_order(OrderIndex::iterator index_it) {
+    OrderHandle& h = index_it->second;
+    h.level->total_shares -= static_cast<std::int64_t>(h.it->remaining);
+    h.level->orders.erase(h.it);
+    if (h.level->orders.empty()) {
+        // No empty levels ever: drop the level immediately (O(log levels)).
+        if (h.side == Side::Bid) {
+            bids_.erase(h.price);
+        } else {
+            asks_.erase(h.price);
+        }
+    }
+    orders_.erase(index_it);
+}
+
 // --- apply ---------------------------------------------------------------------
 
 void apply(Book& book, const Event& event) {
@@ -66,8 +81,20 @@ void apply(Book& book, const Event& event) {
         book.insert_order(event.side, event.price, event.order_id, event.quantity);
         break;
     case EventType::Cancel:
-    case EventType::Execute:
-        break;  // implemented in Task 4
+    case EventType::Execute: {
+        // Identical book effect (spec section 2): shares come off the resting order.
+        // Execute is kept distinct only for later trade stats; execution price
+        // never affects book state.
+        const auto index_it = book.orders_.find(event.order_id);
+        auto& h = index_it->second;
+        if (event.quantity == h.it->remaining) {
+            book.erase_order(index_it);  // reaches zero: removed immediately
+        } else {
+            h.it->remaining -= event.quantity;
+            h.level->total_shares -= static_cast<std::int64_t>(event.quantity);
+        }
+        break;
+    }
     case EventType::Delete:
         break;  // implemented in Task 5
     case EventType::Replace:
