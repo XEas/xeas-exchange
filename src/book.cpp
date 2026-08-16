@@ -76,17 +76,39 @@ void Book::erase_order(OrderIndex::iterator index_it) {
 // --- apply ---------------------------------------------------------------------
 
 void apply(Book& book, const Event& event) {
+    // Strict error policy (spec section 4): replay of well-formed data is
+    // deterministic, so any violation is a bug upstream — fail loud.
+    // Every branch validates fully BEFORE mutating anything.
     switch (event.type) {
-    case EventType::Add:
+    case EventType::Add: {
+        if (event.quantity == 0) {
+            throw BookError(event, "Add: zero quantity");
+        }
+        if (event.price <= 0) {
+            throw BookError(event, "Add: non-positive price");
+        }
+        if (book.orders_.count(event.order_id) != 0) {
+            throw BookError(event, "Add: order_id already exists");
+        }
         book.insert_order(event.side, event.price, event.order_id, event.quantity);
         break;
+    }
     case EventType::Cancel:
     case EventType::Execute: {
-        // Identical book effect (spec section 2): shares come off the resting order.
-        // Execute is kept distinct only for later trade stats; execution price
-        // never affects book state.
+        // Identical book effect (spec section 2); Execute is distinct only for
+        // later trade stats. Execution price never affects book state.
+        const char* const name = (event.type == EventType::Cancel) ? "Cancel" : "Execute";
         const auto index_it = book.orders_.find(event.order_id);
+        if (index_it == book.orders_.end()) {
+            throw BookError(event, std::string(name) + ": unknown order_id");
+        }
+        if (event.quantity == 0) {
+            throw BookError(event, std::string(name) + ": zero quantity");
+        }
         auto& h = index_it->second;
+        if (event.quantity > h.it->remaining) {
+            throw BookError(event, std::string(name) + ": quantity exceeds remaining shares");
+        }
         if (event.quantity == h.it->remaining) {
             book.erase_order(index_it);  // reaches zero: removed immediately
         } else {
@@ -99,14 +121,33 @@ void apply(Book& book, const Event& event) {
         // Remove entirely, whatever the remaining quantity; event.quantity and
         // event.price are ignored by definition (spec section 2).
         const auto index_it = book.orders_.find(event.order_id);
+        if (index_it == book.orders_.end()) {
+            throw BookError(event, "Delete: unknown order_id");
+        }
         book.erase_order(index_it);
         break;
     }
     case EventType::Replace: {
+        const auto index_it = book.orders_.find(event.order_id);
+        if (index_it == book.orders_.end()) {
+            throw BookError(event, "Replace: unknown order_id");
+        }
+        // order_id is live, so the count() check alone also catches
+        // new_order_id == order_id; the explicit test documents the spec.
+        if (event.new_order_id == event.order_id ||
+            book.orders_.count(event.new_order_id) != 0) {
+            throw BookError(event, "Replace: new_order_id already exists");
+        }
+        if (event.quantity == 0) {
+            throw BookError(event, "Replace: zero quantity");
+        }
+        if (event.price <= 0) {
+            throw BookError(event, "Replace: non-positive price");
+        }
         // Atomic remove + insert on the SAME side (resolved from the replaced
         // order, never from event.side), at the BACK of the (possibly new)
         // level's queue — time priority is lost (ITCH semantics).
-        const auto index_it = book.orders_.find(event.order_id);
+        // All validation passed above; neither call below can fail.
         const Side side = index_it->second.side;
         book.erase_order(index_it);
         book.insert_order(side, event.price, event.new_order_id, event.quantity);

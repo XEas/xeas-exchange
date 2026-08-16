@@ -534,4 +534,114 @@ TEST(ReplaceEvent, OldIdGoneNewIdPresentCountsStable) {
     EXPECT_TRUE(book_consistent(book));
 }
 
+// ---------------------------------------------------------------------------
+// Task 7: strict error policy (spec section 4) — one test per bullet
+// ---------------------------------------------------------------------------
+
+TEST(ErrorPolicy, CancelUnknownOrderThrows) {
+    Book book;
+    EXPECT_THROW(apply(book, make_cancel(999, 10)), BookError);
+}
+
+TEST(ErrorPolicy, ExecuteUnknownOrderThrows) {
+    Book book;
+    EXPECT_THROW(apply(book, make_execute(999, 10)), BookError);
+}
+
+TEST(ErrorPolicy, DeleteUnknownOrderThrows) {
+    Book book;
+    EXPECT_THROW(apply(book, make_delete(999)), BookError);
+}
+
+TEST(ErrorPolicy, ReplaceUnknownOrderThrows) {
+    Book book;
+    EXPECT_THROW(apply(book, make_replace(999, 1000, 1'000'000, 10)), BookError);
+}
+
+TEST(ErrorPolicy, AddDuplicateOrderIdThrows) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    EXPECT_THROW(apply(book, make_add(1, Side::Ask, 1'010'000, 50)), BookError);
+}
+
+TEST(ErrorPolicy, ReplaceExistingNewOrderIdThrows) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_add(2, Side::Bid, 990'000, 50));
+    EXPECT_THROW(apply(book, make_replace(1, 2, 1'000'000, 10)), BookError);
+}
+
+TEST(ErrorPolicy, ReplaceNewOrderIdEqualsOrderIdThrows) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    EXPECT_THROW(apply(book, make_replace(1, 1, 1'000'000, 10)), BookError);
+}
+
+TEST(ErrorPolicy, CancelZeroQuantityThrows) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    EXPECT_THROW(apply(book, make_cancel(1, 0)), BookError);
+}
+
+TEST(ErrorPolicy, ExecuteZeroQuantityThrows) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    EXPECT_THROW(apply(book, make_execute(1, 0)), BookError);
+}
+
+TEST(ErrorPolicy, CancelQuantityExceedingRemainingThrows) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    EXPECT_THROW(apply(book, make_cancel(1, 101)), BookError);
+}
+
+TEST(ErrorPolicy, ExecuteQuantityExceedingRemainingThrows) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_execute(1, 60));  // remaining 40
+    EXPECT_THROW(apply(book, make_execute(1, 41)), BookError);
+}
+
+TEST(ErrorPolicy, AddZeroQuantityThrows) {
+    Book book;
+    EXPECT_THROW(apply(book, make_add(1, Side::Bid, 1'000'000, 0)), BookError);
+}
+
+TEST(ErrorPolicy, AddZeroPriceThrows) {
+    Book book;
+    EXPECT_THROW(apply(book, make_add(1, Side::Bid, 0, 100)), BookError);
+}
+
+TEST(ErrorPolicy, AddNegativePriceThrows) {
+    Book book;
+    EXPECT_THROW(apply(book, make_add(1, Side::Bid, -1'000'000, 100)), BookError);
+}
+
+TEST(ErrorPolicy, ReplaceZeroQuantityThrows) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    EXPECT_THROW(apply(book, make_replace(1, 2, 1'000'000, 0)), BookError);
+}
+
+TEST(ErrorPolicy, ReplaceNonPositivePriceThrows) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    EXPECT_THROW(apply(book, make_replace(1, 2, 0, 10)), BookError);
+    EXPECT_THROW(apply(book, make_replace(1, 2, -7, 10)), BookError);
+}
+
+TEST(ErrorPolicy, BookErrorCarriesOffendingEventAndReason) {
+    Book book;
+    const Event bad = make_cancel(777, 10);
+    try {
+        apply(book, bad);
+        FAIL() << "expected BookError";
+    } catch (const BookError& err) {
+        EXPECT_EQ(err.event().type, EventType::Cancel);
+        EXPECT_EQ(err.event().order_id, 777u);
+        EXPECT_EQ(err.event().quantity, 10u);
+        EXPECT_NE(std::string(err.what()), "");
+    }
+}
+
 }  // namespace
