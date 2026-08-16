@@ -70,9 +70,9 @@ Event make_add(OrderId id, Side side, Price price, Qty qty, Timestamp ts = 0) {
 
 namespace xeas {
 
-// Test-only backdoor (friend of Book) used to observe FIFO queue order and,
-// from Task 3 on, to corrupt internal state so the invariant checker can be
-// genuinely tested. Never used by production code.
+// Test-only backdoor (friend of Book) used to observe FIFO queue order and to
+// corrupt internal state so the invariant checker can be genuinely tested.
+// Never used by production code.
 struct BookTestPeer {
     static std::vector<OrderId> level_order_ids(const Book& b, Side side, Price price) {
         std::vector<OrderId> ids;
@@ -88,6 +88,31 @@ struct BookTestPeer {
             for (const auto& order : level->orders) ids.push_back(order.id);
         }
         return ids;
+    }
+
+    // --- corruption helpers (invariant-checker tests only) ---
+    static void corrupt_total_shares(Book& b, Side side, Price price, std::int64_t v) {
+        if (side == Side::Bid) {
+            b.bids_.at(price).total_shares = v;
+        } else {
+            b.asks_.at(price).total_shares = v;
+        }
+    }
+
+    static void add_empty_level(Book& b, Side side, Price price) {
+        if (side == Side::Bid) {
+            b.bids_[price];
+        } else {
+            b.asks_[price];
+        }
+    }
+
+    static void zero_order_qty(Book& b, OrderId id) {
+        b.orders_.at(id).it->remaining = 0;
+    }
+
+    static void drop_from_index(Book& b, OrderId id) {
+        b.orders_.erase(id);
     }
 };
 
@@ -168,6 +193,94 @@ TEST(AddAndQueries, TimePriorityFifoEnqueueAtBack) {
     apply(book, make_add(3, Side::Ask, 1'010'000, 30));
     EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Ask, 1'010'000),
               (std::vector<OrderId>{1, 2, 3}));
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: check_invariants
+// ---------------------------------------------------------------------------
+
+testing::AssertionResult book_consistent(const Book& book) {
+    const auto violations = check_invariants(book);
+    if (violations.empty()) {
+        return testing::AssertionSuccess();
+    }
+    auto result = testing::AssertionFailure();
+    for (const auto& v : violations) {
+        result << v << "; ";
+    }
+    return result;
+}
+
+bool any_contains(const std::vector<std::string>& violations, std::string_view needle) {
+    for (const auto& v : violations) {
+        if (v.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+TEST(Invariants, EmptyBookHasNoViolations) {
+    Book book;
+    EXPECT_TRUE(book_consistent(book));
+}
+
+TEST(Invariants, ConsistentMultiLevelBookHasNoViolations) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_add(2, Side::Bid, 1'000'000, 50));
+    apply(book, make_add(3, Side::Bid, 990'000, 25));
+    apply(book, make_add(4, Side::Ask, 1'010'000, 75));
+    apply(book, make_add(5, Side::Ask, 1'020'000, 10));
+    EXPECT_TRUE(book_consistent(book));
+}
+
+TEST(Invariants, CrossedBookIsStoredAsGivenAndFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'010'000, 100));
+    apply(book, make_add(2, Side::Ask, 1'000'000, 100));  // crosses the bid
+    // apply() does NOT match or reject: both orders rest in the book as given.
+    EXPECT_EQ(book.order_count(), 2u);
+    EXPECT_EQ(book.size_at(Side::Bid, 1'010'000), 100);
+    EXPECT_EQ(book.size_at(Side::Ask, 1'000'000), 100);
+    // Only check_invariants flags it.
+    EXPECT_TRUE(any_contains(check_invariants(book), "crossed"));
+}
+
+TEST(Invariants, LockedBookIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_add(2, Side::Ask, 1'000'000, 100));  // locked: bid == ask
+    EXPECT_TRUE(any_contains(check_invariants(book), "crossed"));
+}
+
+TEST(Invariants, CorruptedCachedTotalSharesIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    BookTestPeer::corrupt_total_shares(book, Side::Bid, 1'000'000, 999);
+    EXPECT_TRUE(any_contains(check_invariants(book), "total_shares"));
+}
+
+TEST(Invariants, EmptyLevelIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'010'000, 100));
+    BookTestPeer::add_empty_level(book, Side::Ask, 1'020'000);
+    EXPECT_TRUE(any_contains(check_invariants(book), "is empty"));
+}
+
+TEST(Invariants, ZeroQuantityOrderIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    BookTestPeer::zero_order_qty(book, 1);
+    EXPECT_TRUE(any_contains(check_invariants(book), "zero-quantity"));
+}
+
+TEST(Invariants, IndexLevelDisagreementIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_add(2, Side::Bid, 1'000'000, 50));
+    BookTestPeer::drop_from_index(book, 2);
+    const auto violations = check_invariants(book);
+    EXPECT_TRUE(any_contains(violations, "missing from index"));
+    EXPECT_TRUE(any_contains(violations, "index size"));
 }
 
 }  // namespace

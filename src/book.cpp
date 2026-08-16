@@ -75,4 +75,94 @@ void apply(Book& book, const Event& event) {
     }
 }
 
+// --- check_invariants ------------------------------------------------------------
+// Out of band: walks the whole book; never called from apply().
+
+std::vector<std::string> check_invariants(const Book& book) {
+    std::vector<std::string> violations;
+
+    // Invariant 1: best bid < best ask when both sides are non-empty.
+    if (!book.bids_.empty() && !book.asks_.empty()) {
+        const Price best_bid = book.bids_.begin()->first;
+        const Price best_ask = book.asks_.begin()->first;
+        if (best_bid >= best_ask) {
+            violations.push_back("book crossed or locked: best bid " + std::to_string(best_bid) +
+                                 " >= best ask " + std::to_string(best_ask));
+        }
+    }
+
+    std::size_t orders_in_levels = 0;
+
+    const auto check_side = [&](const auto& levels, Side side, const char* name) {
+        std::optional<Price> prev_price;
+        for (const auto& [price, level] : levels) {
+            // Invariant 3 (levels): no empty levels.
+            if (level.orders.empty()) {
+                violations.push_back(std::string(name) + " level " + std::to_string(price) +
+                                     " is empty");
+            }
+            // Invariant 4: strictly sorted best-first (descending bids, ascending asks).
+            // Guaranteed by std::map today; kept so Milestone 3 internals stay honest.
+            if (prev_price.has_value()) {
+                const bool ordered =
+                    (side == Side::Bid) ? (*prev_price > price) : (*prev_price < price);
+                if (!ordered) {
+                    violations.push_back(std::string(name) +
+                                         " levels not strictly sorted at price " +
+                                         std::to_string(price));
+                }
+            }
+            prev_price = price;
+
+            std::int64_t sum = 0;
+            for (const auto& order : level.orders) {
+                // Invariant 3 (orders): no zero-quantity orders.
+                if (order.remaining == 0) {
+                    violations.push_back("zero-quantity order " + std::to_string(order.id) +
+                                         " at " + std::string(name) + " level " +
+                                         std::to_string(price));
+                }
+                sum += static_cast<std::int64_t>(order.remaining);
+
+                // Invariant 5 (level -> index): every order in a level is indexed,
+                // and its handle points at exactly this node on this side/price.
+                const auto idx = book.orders_.find(order.id);
+                if (idx == book.orders_.end()) {
+                    violations.push_back("order " + std::to_string(order.id) + " in " + name +
+                                         " level " + std::to_string(price) +
+                                         " missing from index");
+                } else {
+                    const auto& h = idx->second;
+                    if (h.side != side || h.price != price || &*h.it != &order) {
+                        violations.push_back("index entry for order " + std::to_string(order.id) +
+                                             " disagrees with its level");
+                    }
+                }
+                ++orders_in_levels;
+            }
+
+            // Invariant 2: cached aggregate equals the sum of remaining shares.
+            if (sum != level.total_shares) {
+                violations.push_back(std::string(name) + " level " + std::to_string(price) +
+                                     " cached total_shares " +
+                                     std::to_string(level.total_shares) +
+                                     " != sum of orders " + std::to_string(sum));
+            }
+        }
+    };
+
+    check_side(book.bids_, Side::Bid, "bid");
+    check_side(book.asks_, Side::Ask, "ask");
+
+    // Invariant 5 (index -> levels): same count both ways. Combined with the
+    // per-order handle check above this makes the agreement exact.
+    if (orders_in_levels != book.orders_.size()) {
+        violations.push_back("order index size " + std::to_string(book.orders_.size()) +
+                             " != orders present in levels " +
+                             std::to_string(orders_in_levels));
+    }
+
+    return violations;
+}
+
 }  // namespace xeas
