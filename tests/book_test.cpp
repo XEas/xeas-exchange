@@ -114,6 +114,10 @@ struct BookTestPeer {
     static void drop_from_index(Book& b, OrderId id) {
         b.orders_.erase(id);
     }
+
+    static void corrupt_handle_price(Book& b, OrderId id, Price wrong_price) {
+        b.orders_.at(id).price = wrong_price;
+    }
 };
 
 }  // namespace xeas
@@ -281,6 +285,13 @@ TEST(Invariants, IndexLevelDisagreementIsFlagged) {
     const auto violations = check_invariants(book);
     EXPECT_TRUE(any_contains(violations, "missing from index"));
     EXPECT_TRUE(any_contains(violations, "index size"));
+}
+
+TEST(Invariants, IndexHandleDisagreementIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    BookTestPeer::corrupt_handle_price(book, 1, 999'000);
+    EXPECT_TRUE(any_contains(check_invariants(book), "disagrees"));
 }
 
 }  // namespace
