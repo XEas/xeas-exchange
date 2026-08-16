@@ -4,6 +4,8 @@
 
 ## Context
 
+> **Amendments during execution (2026-08-16):** (1) an approved review amendment added a fifth corruption helper (`corrupt_handle_price`) and the `IndexHandleDisagreementIsFlagged` test, so every full-suite total below is one higher than stated; (2) the final whole-branch review added a `default: throw BookError` branch to `apply()`, an `ErrorPolicy.UnknownEventTypeThrows` test, and a `ReplaceEvent.SamePriceAloneAtLevelRecreatesLevel` test. Final suite total: 52 tests.
+
 xeas-exchange (see `DESIGN.md`) is a single-threaded order book reconstruction engine in C++. This plan implements **Milestone 1: the book core** — a pure, deterministic, venue-agnostic L3 (market-by-order) limit order book state machine — exactly per the approved spec. The repo currently contains only docs; this is a greenfield C++20/CMake/GoogleTest build. The book consumes canonical `Event`s (`Add`/`Cancel`/`Delete`/`Execute`/`Replace`), maintains exact book state with strict time priority, exposes a query API (BBO, level size, order lookup), and provides an out-of-band `check_invariants()` checker. Milestone 3 will swap internals behind this same API, so the API here is final.
 
 **Goal:** Implement the canonical `Event` struct, the `Book` type with `apply()` semantics for all five event types, the query API, `check_invariants()`, and a full event-tape unit-test suite.

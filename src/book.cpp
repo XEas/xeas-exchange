@@ -147,12 +147,17 @@ void apply(Book& book, const Event& event) {
         // Atomic remove + insert on the SAME side (resolved from the replaced
         // order, never from event.side), at the BACK of the (possibly new)
         // level's queue — time priority is lost (ITCH semantics).
-        // All validation passed above; neither call below can fail.
+        // All validation passed above; neither call below can fail validation
+        // (allocation failure aside — post-throw state is unspecified, spec section 4).
         const Side side = index_it->second.side;
         book.erase_order(index_it);
         book.insert_order(side, event.price, event.new_order_id, event.quantity);
         break;
     }
+    default:
+        // Fail loud on any value outside the five canonical types (spec
+        // section 4 philosophy): it means a decoder/normalizer bug upstream.
+        throw BookError(event, "unknown event type");
     }
 }
 

@@ -776,4 +776,31 @@ TEST(EventTapes, LevelChurnAndBboUpdatesBothSides) {
     EXPECT_EQ(book.level_count(Side::Ask), 0u);
 }
 
+#undef APPLY_CHECKED
+
+// ---------------------------------------------------------------------------
+// Final-review additions: fail-loud on unknown type; replace alone at level
+// ---------------------------------------------------------------------------
+
+TEST(ErrorPolicy, UnknownEventTypeThrows) {
+    Book book;
+    Event e;
+    e.type = static_cast<EventType>(99);
+    e.order_id = 1;
+    EXPECT_THROW(apply(book, e), BookError);
+}
+
+TEST(ReplaceEvent, SamePriceAloneAtLevelRecreatesLevel) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'010'000, 100));  // alone at its level
+    apply(book, make_replace(1, 2, 1'010'000, 60));  // erase drops the level; insert recreates it
+
+    EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Ask, 1'010'000),
+              (std::vector<OrderId>{2}));
+    EXPECT_EQ(book.size_at(Side::Ask, 1'010'000), 60);
+    EXPECT_EQ(book.level_count(Side::Ask), 1u);
+    EXPECT_EQ(book.order_count(), 1u);
+    EXPECT_TRUE(book_consistent(book));
+}
+
 }  // namespace
