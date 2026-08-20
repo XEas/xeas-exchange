@@ -9,6 +9,7 @@
 #include "xeas/replay.h"
 #include "xeas/router.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -27,6 +28,18 @@ int usage() {
                  "  --progress N      messages between progress lines (default 10000000)\n"
                  "  --quiet           no progress lines\n";
     return 1;
+}
+
+bool parse_count(const char* s, std::uint64_t& out) {
+    if (s == nullptr || s[0] == '\0') return false;
+    if (s[0] == '-' || s[0] == '+') return false;
+    char* end;
+    errno = 0;
+    std::uint64_t val = std::strtoull(s, &end, 10);
+    if (errno == ERANGE) return false;
+    if (*end != '\0') return false;
+    out = val;
+    return true;
 }
 
 constexpr struct { char type; const char* name; } kTypeNames[] = {
@@ -125,9 +138,9 @@ int main(int argc, char** argv) {
         if (arg == "--quiet") {
             opts.progress_every = 0;
         } else if (arg == "--sweep-every" && i + 1 < argc) {
-            opts.invariant_sweep_every = std::strtoull(argv[++i], nullptr, 10);
+            if (!parse_count(argv[++i], opts.invariant_sweep_every)) return usage();
         } else if (arg == "--progress" && i + 1 < argc) {
-            opts.progress_every = std::strtoull(argv[++i], nullptr, 10);
+            if (!parse_count(argv[++i], opts.progress_every)) return usage();
         } else if (!arg.empty() && arg.front() == '-') {
             return usage();
         } else if (!have_file) {
