@@ -22,6 +22,13 @@ if(NOT MSVC)
   target_compile_options(xeas_feed PRIVATE -Wall -Wextra)
 endif()
 
+# --- itch_replay CLI (Milestone 2) -------------------------------------------
+add_executable(itch_replay src/itch_replay_main.cpp)
+target_link_libraries(itch_replay PRIVATE xeas_feed)
+if(NOT MSVC)
+  target_compile_options(itch_replay PRIVATE -Wall -Wextra)
+endif()
+
 # --- tests -------------------------------------------------------------------
 enable_testing()
 
