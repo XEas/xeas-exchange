@@ -5,6 +5,8 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 namespace {
@@ -94,6 +96,154 @@ TEST(Fixture, RawSentinelAndTruncate) {
     EXPECT_EQ(b.bytes().size(), 21u + 2u + 2u);
     b.truncate_last(4);
     EXPECT_EQ(b.bytes().size(), 21u);
+}
+
+// ---------------------------------------------------------------------------
+// Framing: ItchReader
+// ---------------------------------------------------------------------------
+
+TEST(Framing, EmptyStreamIsCleanEof) {
+    ItchBuilder b;
+    auto in = b.stream();
+    ItchReader reader(in);
+    EXPECT_FALSE(reader.next().has_value());
+    EXPECT_EQ(reader.bytes_consumed(), 0u);
+    EXPECT_EQ(reader.messages_framed(), 0u);
+}
+
+TEST(Framing, SingleFrameRoundTrip) {
+    ItchBuilder b;
+    b.add_order(1, 1000, 42, 'B', 100, "AAPL", 500'000);
+    auto in = b.stream();
+    ItchReader reader(in);
+    const auto frame = reader.next();
+    ASSERT_TRUE(frame.has_value());
+    EXPECT_EQ(frame->size, 36u);
+    EXPECT_EQ(std::to_integer<char>(frame->data[0]), 'A');
+    EXPECT_FALSE(reader.next().has_value());
+    EXPECT_EQ(reader.bytes_consumed(), 38u);
+    EXPECT_EQ(reader.messages_framed(), 1u);
+}
+
+TEST(Framing, MultipleFramesInOrder) {
+    ItchBuilder b;
+    b.stock_directory(1, 100, "AAPL");
+    b.add_order(1, 200, 42, 'B', 100, "AAPL", 500'000);
+    b.order_delete(1, 300, 42);
+    auto in = b.stream();
+    ItchReader reader(in);
+    const char expected_types[] = {'R', 'A', 'D'};
+    const std::size_t expected_sizes[] = {39, 36, 19};
+    for (int i = 0; i < 3; ++i) {
+        const auto frame = reader.next();
+        ASSERT_TRUE(frame.has_value()) << "frame " << i;
+        EXPECT_EQ(std::to_integer<char>(frame->data[0]), expected_types[i]);
+        EXPECT_EQ(frame->size, expected_sizes[i]);
+    }
+    EXPECT_FALSE(reader.next().has_value());
+    EXPECT_EQ(reader.bytes_consumed(), 41u + 38u + 21u);
+    EXPECT_EQ(reader.messages_framed(), 3u);
+}
+
+TEST(Framing, SentinelIsCleanEofAndTerminal) {
+    ItchBuilder b;
+    b.order_delete(1, 1000, 42).sentinel();
+    b.add_order(1, 2000, 43, 'B', 100, "AAPL", 500'000);  // after sentinel: ignored
+    auto in = b.stream();
+    ItchReader reader(in);
+    ASSERT_TRUE(reader.next().has_value());
+    EXPECT_FALSE(reader.next().has_value());
+    EXPECT_FALSE(reader.next().has_value());  // stays EOF
+    EXPECT_EQ(reader.messages_framed(), 1u);
+    EXPECT_EQ(reader.bytes_consumed(), 21u + 2u);  // frame + sentinel bytes
+}
+
+TEST(Framing, TinyBufferForcesStraddle) {
+    ItchBuilder b;
+    for (std::uint64_t i = 0; i < 40; ++i) {
+        b.add_order(1, 1000 + i, 100 + i, 'B', 10, "AAPL", 500'000);
+    }
+    auto in = b.stream();
+    // buffer_size is clamped up to one max frame (2 + 512 = 514 bytes);
+    // 40 x 38-byte frames = 1520 bytes forces refills with mid-frame
+    // compaction (38 does not divide 514).
+    ItchReader reader(in, 1);
+    std::uint64_t n = 0;
+    while (const auto frame = reader.next()) {
+        EXPECT_EQ(frame->size, 36u);
+        EXPECT_EQ(std::to_integer<char>(frame->data[0]), 'A');
+        ++n;
+    }
+    EXPECT_EQ(n, 40u);
+    EXPECT_EQ(reader.messages_framed(), 40u);
+    EXPECT_EQ(reader.bytes_consumed(), 40u * 38u);
+}
+
+TEST(Framing, TruncatedPrefixThrowsWithPosition) {
+    ItchBuilder b;
+    b.order_delete(1, 1000, 42).raw(std::string("\x00", 1));  // lone prefix byte
+    auto in = b.stream();
+    ItchReader reader(in);
+    ASSERT_TRUE(reader.next().has_value());
+    try {
+        reader.next();
+        FAIL() << "expected FeedError";
+    } catch (const FeedError& e) {
+        EXPECT_EQ(e.reason(), "truncated length prefix");
+        EXPECT_EQ(e.byte_offset(), 21u);  // one delete frame consumed
+        EXPECT_EQ(e.message_index(), 1u);
+        EXPECT_EQ(e.message_type(), '\0');
+    }
+}
+
+TEST(Framing, TruncatedBodyThrowsWithPosition) {
+    ItchBuilder b;
+    b.add_order(1, 1000, 42, 'B', 100, "AAPL", 500'000).truncate_last(5);
+    auto in = b.stream();
+    ItchReader reader(in);
+    try {
+        reader.next();
+        FAIL() << "expected FeedError";
+    } catch (const FeedError& e) {
+        EXPECT_EQ(e.reason(), "truncated message body");
+        EXPECT_EQ(e.byte_offset(), 0u);
+        EXPECT_EQ(e.message_index(), 0u);
+        EXPECT_EQ(e.message_type(), 'A');  // the type byte was readable
+    }
+}
+
+TEST(Framing, ImplausibleLengthThrows) {
+    ItchBuilder b;
+    b.raw(std::string("\x02\x01", 2));  // length 513 > 512
+    auto in = b.stream();
+    ItchReader reader(in);
+    try {
+        reader.next();
+        FAIL() << "expected FeedError";
+    } catch (const FeedError& e) {
+        EXPECT_EQ(e.reason(), "implausible frame length 513");
+        EXPECT_EQ(e.byte_offset(), 0u);
+        EXPECT_EQ(e.message_index(), 0u);
+    }
+}
+
+TEST(Framing, FileConstructorReadsAndMissingFileThrows) {
+    ItchBuilder b;
+    b.order_delete(7, 1000, 42);
+    const auto path = std::filesystem::temp_directory_path() / "xeas_itch_framing_test.bin";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write(b.bytes().data(), static_cast<std::streamsize>(b.bytes().size()));
+    }
+    {
+        ItchReader reader(path);
+        const auto frame = reader.next();
+        ASSERT_TRUE(frame.has_value());
+        EXPECT_EQ(std::to_integer<char>(frame->data[0]), 'D');
+        EXPECT_FALSE(reader.next().has_value());
+    }
+    std::filesystem::remove(path);
+    EXPECT_THROW(ItchReader(std::filesystem::path("/nonexistent/xeas.itch")), FeedError);
 }
 
 }  // namespace
