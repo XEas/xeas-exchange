@@ -180,4 +180,22 @@ BookMessage decode_book_message(const std::byte* data, std::size_t size) {
     return out;
 }
 
+StockDirectoryEntry decode_stock_directory(const std::byte* data, std::size_t size) {
+    const char type = std::to_integer<char>(data[0]);
+    if (type != 'R') {
+        throw FeedError("not a stock directory message", 0, 0, type);
+    }
+    if (size != 39) {
+        throw FeedError("wrong body length " + std::to_string(size) +
+                            " (expected 39)",
+                        0, 0, 'R');
+    }
+    StockDirectoryEntry out;
+    out.stock_locate = read_u16(data + 1);
+    std::string symbol(reinterpret_cast<const char*>(data + 11), 8);
+    while (!symbol.empty() && symbol.back() == ' ') symbol.pop_back();
+    out.symbol = std::move(symbol);
+    return out;
+}
+
 }  // namespace xeas

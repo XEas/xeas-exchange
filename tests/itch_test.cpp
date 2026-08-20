@@ -416,4 +416,49 @@ TEST(Decode, NonBookTypeThrows) {
     EXPECT_THROW(decode_book_message(frame->data, frame->size), FeedError);
 }
 
+// ---------------------------------------------------------------------------
+// Decode: decode_stock_directory ('R')
+// ---------------------------------------------------------------------------
+
+TEST(Decode, StockDirectoryTrimsPadding) {
+    ItchBuilder b;
+    b.stock_directory(42, 100, "ZVZZT");  // padded to "ZVZZT   " on the wire
+    auto in = b.stream();
+    ItchReader reader(in);
+    const auto frame = reader.next();
+    ASSERT_TRUE(frame.has_value());
+    const StockDirectoryEntry entry =
+        decode_stock_directory(frame->data, frame->size);
+    EXPECT_EQ(entry.stock_locate, 42);
+    EXPECT_EQ(entry.symbol, "ZVZZT");
+}
+
+TEST(Decode, StockDirectoryFullWidthSymbolKept) {
+    ItchBuilder b;
+    b.stock_directory(1, 100, "ABCDEFGH");
+    auto in = b.stream();
+    ItchReader reader(in);
+    const auto frame = reader.next();
+    ASSERT_TRUE(frame.has_value());
+    EXPECT_EQ(decode_stock_directory(frame->data, frame->size).symbol, "ABCDEFGH");
+}
+
+TEST(Decode, StockDirectoryWrongLengthOrTypeThrows) {
+    ItchBuilder b;
+    b.stock_directory(1, 100, "AAPL");
+    auto in = b.stream();
+    ItchReader reader(in);
+    const auto frame = reader.next();
+    ASSERT_TRUE(frame.has_value());
+    EXPECT_THROW(decode_stock_directory(frame->data, frame->size - 1), FeedError);
+
+    ItchBuilder b2;
+    b2.order_delete(1, 100, 42);  // wrong type byte
+    auto in2 = b2.stream();
+    ItchReader reader2(in2);
+    const auto frame2 = reader2.next();
+    ASSERT_TRUE(frame2.has_value());
+    EXPECT_THROW(decode_stock_directory(frame2->data, frame2->size), FeedError);
+}
+
 }  // namespace
