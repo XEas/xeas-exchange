@@ -13,6 +13,15 @@ if(NOT MSVC)
   target_compile_options(xeas_core PRIVATE -Wall -Wextra)
 endif()
 
+# --- feed library (Milestone 2) ----------------------------------------------
+# Separate target so layering is enforced at link level: the book core never
+# sees feed or I/O code, and Milestone 3 benchmarks can link book-only.
+add_library(xeas_feed src/itch.cpp)
+target_link_libraries(xeas_feed PUBLIC xeas_core)
+if(NOT MSVC)
+  target_compile_options(xeas_feed PRIVATE -Wall -Wextra)
+endif()
+
 # --- tests -------------------------------------------------------------------
 enable_testing()
 
@@ -32,5 +41,12 @@ if(NOT MSVC)
   target_compile_options(book_test PRIVATE -Wall -Wextra)
 endif()
 
+add_executable(itch_test tests/itch_test.cpp)
+target_link_libraries(itch_test PRIVATE xeas_feed GTest::gtest_main)
+if(NOT MSVC)
+  target_compile_options(itch_test PRIVATE -Wall -Wextra)
+endif()
+
 include(GoogleTest)
 gtest_discover_tests(book_test)
+gtest_discover_tests(itch_test)
