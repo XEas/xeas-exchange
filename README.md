@@ -16,7 +16,7 @@ event-sourced state machine. See [DESIGN.md](DESIGN.md) for the full design.
 | Milestone | State |
 |---|---|
 | 1. Book core — data structures, `apply()`, queries, invariant checker | ✅ done |
-| 2. ITCH replay — decode and replay a real trading day | planned |
+| 2. ITCH replay — decode and replay a real trading day | ✅ done |
 | 3. Benchmark & optimize — measured swap to fast internals | planned |
 | 4. (Optional) live mode | planned |
 
@@ -45,6 +45,28 @@ Current internals are the deliberately simple, correctness-first baseline
 (`std::map` + `std::list`); Milestone 3 swaps them behind the same API with
 before/after numbers.
 
+## What's here (Milestone 2)
+
+- `include/xeas/itch.h`, `src/itch.cpp` — framing reader for the ITCH 5.0
+  historical dump (`[u16 length][body]` frames, big-endian) and the fused
+  decoder+normalizer: `A F X D E C U` become canonical `Event`s, `R` feeds
+  locate→symbol names, everything else is counted and skipped. Strict
+  `FeedError` on truncation, implausible lengths, malformed bodies.
+- `include/xeas/router.h`, `src/router.cpp` — `BookRouter`: one lazily-created
+  `Book` per stock locate (flat 65,536-slot table, O(1) routing).
+- `include/xeas/replay.h`, `src/replay.cpp` — `replay_stream()`: the replay
+  driver with per-type stats, live-order tracking, timestamp-regression
+  counting, periodic invariant sweeps. Crossed/locked books are classified as
+  data reality (halts, auction crosses) — counted, reported, never fatal;
+  structural violations throw `ReplayError`.
+- `itch_replay` CLI — `itch_replay <file> [--sweep-every N] [--progress N]
+  [--quiet]` on an uncompressed `.NASDAQ_ITCH50` file (gunzip first). Exit
+  codes: 0 ok, 1 usage/unopenable, 2 feed error, 3 book error, 4 replay error;
+  stats-so-far always printed.
+- Tests use synthetic binary fixtures (`tests/itch_fixture.h`); no data files
+  are checked in. A differential suite replays the same logical tape as binary
+  and as direct `Event`s and requires every book query to agree.
+
 ## Build & test
 
 Requires CMake ≥ 3.24 and a C++20 compiler. The first configure fetches
@@ -56,7 +78,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Expected: `100% tests passed, 0 tests failed out of 52`.
+Expected: `100% tests passed, 0 tests failed out of 108`.
 
 ```bash
 ./build/book_test --gtest_filter='EventTapes.*'   # run a subset directly
@@ -65,9 +87,19 @@ Expected: `100% tests passed, 0 tests failed out of 52`.
 ## Layout
 
 ```
-include/xeas/event.h   Event, Side, EventType, type aliases (Price, Qty, OrderId)
-include/xeas/book.h    Book, apply(), queries, check_invariants(), BookError
-src/book.cpp           implementation
-tests/book_test.cpp    event-tape unit tests (52 tests)
-docs/superpowers/      design spec and executed implementation plan
+include/xeas/event.h    Event, Side, EventType, type aliases (Price, Qty, OrderId)
+include/xeas/book.h     Book, apply(), queries, check_invariants(), BookError
+include/xeas/itch.h     FeedError, FramedMessage, ItchReader, decode functions
+include/xeas/router.h   BookRouter (one Book per stock locate)
+include/xeas/replay.h   ReplayOptions, ReplayStats, ReplayError, replay_stream()
+src/book.cpp            implementation
+src/itch.cpp            framing + fused ITCH decoder/normalizer
+src/router.cpp          locate routing
+src/replay.cpp          replay driver
+src/itch_replay_main.cpp  the itch_replay CLI
+tests/book_test.cpp     event-tape unit tests (57 tests)
+tests/itch_fixture.h    ItchBuilder — synthetic ITCH binary fixtures
+tests/itch_test.cpp     Framing / Decode / Router suites (36 tests)
+tests/replay_test.cpp   Replay / Differential suites (15 tests)
+docs/superpowers/       design spec and executed implementation plan
 ```
