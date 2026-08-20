@@ -1,4 +1,5 @@
 #include "xeas/itch.h"
+#include "xeas/router.h"
 
 #include "itch_fixture.h"
 
@@ -21,6 +22,16 @@ BookMessage decode_one(const ItchBuilder& b) {
     const auto frame = reader.next();
     EXPECT_TRUE(frame.has_value());
     return decode_book_message(frame->data, frame->size);
+}
+
+Event make_add_event(OrderId id, Side side, Price price, Qty qty) {
+    Event e;
+    e.type = EventType::Add;
+    e.order_id = id;
+    e.side = side;
+    e.price = price;
+    e.quantity = qty;
+    return e;
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +470,64 @@ TEST(Decode, StockDirectoryWrongLengthOrTypeThrows) {
     const auto frame2 = reader2.next();
     ASSERT_TRUE(frame2.has_value());
     EXPECT_THROW(decode_stock_directory(frame2->data, frame2->size), FeedError);
+}
+
+// ---------------------------------------------------------------------------
+// Router: BookRouter
+// ---------------------------------------------------------------------------
+
+TEST(Router, LazyCreation) {
+    BookRouter router;
+    EXPECT_EQ(router.find(5), nullptr);
+    EXPECT_EQ(router.book_count(), 0u);
+    Book& book = router.book_for(5);
+    EXPECT_EQ(router.find(5), &book);
+    EXPECT_EQ(router.book_count(), 1u);
+}
+
+TEST(Router, SameLocateSameBook) {
+    BookRouter router;
+    Book& a = router.book_for(7);
+    Book& b = router.book_for(7);
+    EXPECT_EQ(&a, &b);
+    EXPECT_EQ(router.book_count(), 1u);
+}
+
+TEST(Router, DistinctLocatesAreIsolated) {
+    BookRouter router;
+    apply(router.book_for(1), make_add_event(10, Side::Bid, 1'000'000, 100));
+    EXPECT_EQ(router.book_for(1).order_count(), 1u);
+    EXPECT_EQ(router.book_for(2).order_count(), 0u);
+    EXPECT_EQ(router.book_count(), 2u);
+}
+
+TEST(Router, SymbolOrLocateFallsBackThenNames) {
+    BookRouter router;
+    EXPECT_EQ(router.symbol_or_locate(42), "locate 42");
+    router.set_symbol(42, "AAPL");
+    EXPECT_EQ(router.symbol_or_locate(42), "AAPL");
+    // Symbols are independent of book creation ('R' needs no ordering).
+    EXPECT_EQ(router.find(42), nullptr);
+}
+
+TEST(Router, ExtremeLocatesWork) {
+    BookRouter router;
+    router.book_for(0);
+    router.book_for(65'535);
+    EXPECT_NE(router.find(0), nullptr);
+    EXPECT_NE(router.find(65'535), nullptr);
+    EXPECT_EQ(router.book_count(), 2u);
+}
+
+TEST(Router, ForEachBookVisitsAllInLocateOrder) {
+    BookRouter router;
+    router.book_for(30);
+    router.book_for(10);
+    router.book_for(20);
+    std::vector<std::uint16_t> visited;
+    router.for_each_book(
+        [&](std::uint16_t locate, const Book&) { visited.push_back(locate); });
+    EXPECT_EQ(visited, (std::vector<std::uint16_t>{10, 20, 30}));
 }
 
 }  // namespace

@@ -16,7 +16,7 @@ endif()
 # --- feed library (Milestone 2) ----------------------------------------------
 # Separate target so layering is enforced at link level: the book core never
 # sees feed or I/O code, and Milestone 3 benchmarks can link book-only.
-add_library(xeas_feed src/itch.cpp)
+add_library(xeas_feed src/itch.cpp src/router.cpp)
 target_link_libraries(xeas_feed PUBLIC xeas_core)
 if(NOT MSVC)
   target_compile_options(xeas_feed PRIVATE -Wall -Wextra)
