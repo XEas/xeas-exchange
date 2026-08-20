@@ -271,4 +271,142 @@ TEST(Replay, ReplayErrorCarriesContext) {
     EXPECT_NE(what.find("order index size"), std::string::npos);
 }
 
+// ---------------------------------------------------------------------------
+// Differential: the same logical tape expressed twice — binary via
+// ItchBuilder -> replay_stream, and as Events applied to hand-routed Books.
+// Every query must agree across all books.
+// ---------------------------------------------------------------------------
+
+struct DirectEvent {
+    std::uint16_t locate;
+    Event event;
+};
+
+Event ev(EventType type, Timestamp ts, OrderId id, Side side, Price price,
+         Qty qty, OrderId new_id = 0) {
+    Event e;
+    e.type = type;
+    e.timestamp = ts;
+    e.order_id = id;
+    e.side = side;
+    e.price = price;
+    e.quantity = qty;
+    e.new_order_id = new_id;
+    return e;
+}
+
+std::map<std::uint16_t, Book> apply_direct(const std::vector<DirectEvent>& tape) {
+    std::map<std::uint16_t, Book> books;
+    for (const auto& [locate, event] : tape) apply(books[locate], event);
+    return books;
+}
+
+void expect_books_agree(const BookRouter& router,
+                        const std::map<std::uint16_t, Book>& direct,
+                        const std::vector<Price>& prices,
+                        const std::vector<OrderId>& order_ids) {
+    EXPECT_EQ(router.book_count(), direct.size());
+    for (const auto& [locate, expected] : direct) {
+        const Book* actual = router.find(locate);
+        ASSERT_NE(actual, nullptr) << "locate " << locate;
+        EXPECT_EQ(actual->order_count(), expected.order_count()) << "locate " << locate;
+        EXPECT_EQ(actual->level_count(Side::Bid), expected.level_count(Side::Bid));
+        EXPECT_EQ(actual->level_count(Side::Ask), expected.level_count(Side::Ask));
+
+        const auto bb_a = actual->best_bid();
+        const auto bb_e = expected.best_bid();
+        ASSERT_EQ(bb_a.has_value(), bb_e.has_value()) << "locate " << locate;
+        if (bb_a.has_value()) {
+            EXPECT_EQ(bb_a->price, bb_e->price);
+            EXPECT_EQ(bb_a->total_shares, bb_e->total_shares);
+        }
+        const auto ba_a = actual->best_ask();
+        const auto ba_e = expected.best_ask();
+        ASSERT_EQ(ba_a.has_value(), ba_e.has_value()) << "locate " << locate;
+        if (ba_a.has_value()) {
+            EXPECT_EQ(ba_a->price, ba_e->price);
+            EXPECT_EQ(ba_a->total_shares, ba_e->total_shares);
+        }
+        for (const Price p : prices) {
+            EXPECT_EQ(actual->size_at(Side::Bid, p), expected.size_at(Side::Bid, p))
+                << "locate " << locate << " bid " << p;
+            EXPECT_EQ(actual->size_at(Side::Ask, p), expected.size_at(Side::Ask, p))
+                << "locate " << locate << " ask " << p;
+        }
+        for (const OrderId id : order_ids) {
+            const auto oa = actual->find_order(id);
+            const auto oe = expected.find_order(id);
+            ASSERT_EQ(oa.has_value(), oe.has_value()) << "order " << id;
+            if (oa.has_value()) {
+                EXPECT_EQ(oa->side, oe->side) << "order " << id;
+                EXPECT_EQ(oa->price, oe->price) << "order " << id;
+                EXPECT_EQ(oa->remaining_qty, oe->remaining_qty) << "order " << id;
+            }
+        }
+    }
+}
+
+TEST(Differential, TwoSymbolMixedTapeAgrees) {
+    ItchBuilder b;
+    std::vector<DirectEvent> direct;
+
+    b.stock_directory(1, 50, "AAPL");  // no direct counterpart (not an Event)
+    b.add_order(1, 100, 10, 'B', 100, "AAPL", 1'500'000);
+    direct.push_back({1, ev(EventType::Add, 100, 10, Side::Bid, 1'500'000, 100)});
+    b.add_order(1, 110, 11, 'S', 80, "AAPL", 1'501'000);
+    direct.push_back({1, ev(EventType::Add, 110, 11, Side::Ask, 1'501'000, 80)});
+    b.add_order(2, 120, 20, 'B', 50, "MSFT", 3'000'000);
+    direct.push_back({2, ev(EventType::Add, 120, 20, Side::Bid, 3'000'000, 50)});
+    b.order_executed(1, 130, 11, 30, 7001);
+    direct.push_back({1, ev(EventType::Execute, 130, 11, Side::Bid, 0, 30)});
+    b.order_cancel(1, 140, 10, 40);
+    direct.push_back({1, ev(EventType::Cancel, 140, 10, Side::Bid, 0, 40)});
+    b.order_delete(1, 150, 11);
+    direct.push_back({1, ev(EventType::Delete, 150, 11, Side::Bid, 0, 0)});
+    b.add_order_mpid(2, 160, 22, 'S', 10, "MSFT", 3'020'000, "NSDQ");
+    direct.push_back({2, ev(EventType::Add, 160, 22, Side::Ask, 3'020'000, 10)});
+
+    BookRouter router;
+    run(b, router);
+    expect_books_agree(router, apply_direct(direct),
+                       {1'500'000, 1'501'000, 3'000'000, 3'020'000},
+                       {10, 11, 20, 22});
+}
+
+TEST(Differential, ReplaceChainTapeAgrees) {
+    ItchBuilder b;
+    std::vector<DirectEvent> direct;
+
+    b.add_order(3, 100, 1, 'S', 100, "ZVZZT", 2'000'000);
+    direct.push_back({3, ev(EventType::Add, 100, 1, Side::Ask, 2'000'000, 100)});
+    b.order_replace(3, 110, 1, 2, 90, 2'001'000);
+    direct.push_back({3, ev(EventType::Replace, 110, 1, Side::Bid, 2'001'000, 90, 2)});
+    b.order_executed_price(3, 120, 2, 40, 8001, 'Y', 2'001'000);
+    direct.push_back({3, ev(EventType::Execute, 120, 2, Side::Bid, 0, 40)});
+    b.order_replace(3, 130, 2, 3, 50, 1'999'000);
+    direct.push_back({3, ev(EventType::Replace, 130, 2, Side::Bid, 1'999'000, 50, 3)});
+    // Note: event.side on Replace/Execute is not meaningful; the book resolves
+    // side from the referenced order — both paths must agree regardless.
+
+    BookRouter router;
+    run(b, router);
+    expect_books_agree(router, apply_direct(direct),
+                       {2'000'000, 2'001'000, 1'999'000}, {1, 2, 3});
+}
+
+TEST(Differential, CrossedTapeAgrees) {
+    ItchBuilder b;
+    std::vector<DirectEvent> direct;
+
+    b.add_order(4, 100, 1, 'B', 10, "TEST", 1'000'000);
+    direct.push_back({4, ev(EventType::Add, 100, 1, Side::Bid, 1'000'000, 10)});
+    b.add_order(4, 110, 2, 'S', 10, "TEST", 995'000);  // crossed — stored as given
+    direct.push_back({4, ev(EventType::Add, 110, 2, Side::Ask, 995'000, 10)});
+
+    BookRouter router;
+    const ReplayStats stats = run(b, router);
+    EXPECT_EQ(stats.crossed_episodes, 1u);
+    expect_books_agree(router, apply_direct(direct), {1'000'000, 995'000}, {1, 2});
+}
+
 }  // namespace
