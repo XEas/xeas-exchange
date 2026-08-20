@@ -14,6 +14,15 @@ namespace {
 using namespace xeas;
 using xeas::test::ItchBuilder;
 
+// Frames one builder message through the real reader and decodes it.
+BookMessage decode_one(const ItchBuilder& b) {
+    auto in = b.stream();
+    ItchReader reader(in);
+    const auto frame = reader.next();
+    EXPECT_TRUE(frame.has_value());
+    return decode_book_message(frame->data, frame->size);
+}
+
 // ---------------------------------------------------------------------------
 // Classify: is_book_message()
 // ---------------------------------------------------------------------------
@@ -244,6 +253,167 @@ TEST(Framing, FileConstructorReadsAndMissingFileThrows) {
     }
     std::filesystem::remove(path);
     EXPECT_THROW(ItchReader(std::filesystem::path("/nonexistent/xeas.itch")), FeedError);
+}
+
+// ---------------------------------------------------------------------------
+// Decode: decode_book_message — one test per type, EVERY Event field asserted
+// ---------------------------------------------------------------------------
+
+TEST(Decode, AddOrderDecodesEveryField) {
+    ItchBuilder b;
+    b.add_order(0xBEEF, 0xFFEEDDCCBBAAULL, 0x0102030405060708ULL, 'B', 250,
+                "AAPL", 1'234'500);
+    const BookMessage m = decode_one(b);
+    EXPECT_EQ(m.stock_locate, 0xBEEF);
+    EXPECT_EQ(m.event.type, EventType::Add);
+    EXPECT_EQ(m.event.timestamp, 0xFFEEDDCCBBAAULL);  // full 48-bit assembly
+    EXPECT_EQ(m.event.order_id, 0x0102030405060708ULL);
+    EXPECT_EQ(m.event.side, Side::Bid);
+    EXPECT_EQ(m.event.price, 1'234'500);
+    EXPECT_EQ(m.event.quantity, 250u);
+    EXPECT_EQ(m.event.new_order_id, 0u);
+}
+
+TEST(Decode, AddOrderSellSideMapsToAsk) {
+    ItchBuilder b;
+    b.add_order(1, 100, 42, 'S', 10, "AAPL", 500'000);
+    EXPECT_EQ(decode_one(b).event.side, Side::Ask);
+}
+
+TEST(Decode, AddOrderMpidDropsAttribution) {
+    ItchBuilder b;
+    b.add_order_mpid(7, 200, 43, 'B', 20, "MSFT", 3'000'000, "NSDQ");
+    const BookMessage m = decode_one(b);
+    EXPECT_EQ(m.stock_locate, 7);
+    EXPECT_EQ(m.event.type, EventType::Add);  // same Event as 'A'
+    EXPECT_EQ(m.event.timestamp, 200u);
+    EXPECT_EQ(m.event.order_id, 43u);
+    EXPECT_EQ(m.event.side, Side::Bid);
+    EXPECT_EQ(m.event.price, 3'000'000);
+    EXPECT_EQ(m.event.quantity, 20u);
+    EXPECT_EQ(m.event.new_order_id, 0u);
+}
+
+TEST(Decode, CancelDecodes) {
+    ItchBuilder b;
+    b.order_cancel(3, 300, 44, 15);
+    const BookMessage m = decode_one(b);
+    EXPECT_EQ(m.stock_locate, 3);
+    EXPECT_EQ(m.event.type, EventType::Cancel);
+    EXPECT_EQ(m.event.timestamp, 300u);
+    EXPECT_EQ(m.event.order_id, 44u);
+    EXPECT_EQ(m.event.quantity, 15u);
+    EXPECT_EQ(m.event.price, 0);
+    EXPECT_EQ(m.event.new_order_id, 0u);
+}
+
+TEST(Decode, DeleteDecodes) {
+    ItchBuilder b;
+    b.order_delete(4, 400, 45);
+    const BookMessage m = decode_one(b);
+    EXPECT_EQ(m.stock_locate, 4);
+    EXPECT_EQ(m.event.type, EventType::Delete);
+    EXPECT_EQ(m.event.timestamp, 400u);
+    EXPECT_EQ(m.event.order_id, 45u);
+    EXPECT_EQ(m.event.quantity, 0u);
+    EXPECT_EQ(m.event.price, 0);
+    EXPECT_EQ(m.event.new_order_id, 0u);
+}
+
+TEST(Decode, ExecutedDecodes) {
+    ItchBuilder b;
+    b.order_executed(5, 500, 46, 30, 0xDEADBEEFULL);  // match number ignored
+    const BookMessage m = decode_one(b);
+    EXPECT_EQ(m.stock_locate, 5);
+    EXPECT_EQ(m.event.type, EventType::Execute);
+    EXPECT_EQ(m.event.timestamp, 500u);
+    EXPECT_EQ(m.event.order_id, 46u);
+    EXPECT_EQ(m.event.quantity, 30u);
+    EXPECT_EQ(m.event.price, 0);
+    EXPECT_EQ(m.event.new_order_id, 0u);
+}
+
+TEST(Decode, ExecutedWithPriceIgnoresPrintableAndPrice) {
+    ItchBuilder b;
+    b.order_executed_price(6, 600, 47, 40, 99, 'N', 9'999'999);
+    const BookMessage m = decode_one(b);
+    EXPECT_EQ(m.event.type, EventType::Execute);
+    EXPECT_EQ(m.event.order_id, 47u);
+    EXPECT_EQ(m.event.quantity, 40u);
+    EXPECT_EQ(m.event.price, 0);  // execution price never affects the book
+}
+
+TEST(Decode, ReplaceDecodes) {
+    ItchBuilder b;
+    b.order_replace(8, 800, 48, 49, 60, 2'000'000);
+    const BookMessage m = decode_one(b);
+    EXPECT_EQ(m.stock_locate, 8);
+    EXPECT_EQ(m.event.type, EventType::Replace);
+    EXPECT_EQ(m.event.timestamp, 800u);
+    EXPECT_EQ(m.event.order_id, 48u);
+    EXPECT_EQ(m.event.new_order_id, 49u);
+    EXPECT_EQ(m.event.quantity, 60u);
+    EXPECT_EQ(m.event.price, 2'000'000);
+    // 'U' carries no side byte; Event.side stays at its default and the book
+    // resolves side from the old order. Do not assert side here.
+}
+
+TEST(Decode, TimestampWidensFull48Bits) {
+    ItchBuilder b;
+    b.order_delete(1, 0xFFFFFFFFFFFFULL, 42);  // max 6-byte value
+    EXPECT_EQ(decode_one(b).event.timestamp, 0xFFFFFFFFFFFFULL);
+}
+
+TEST(Decode, WrongBodyLengthThrowsForEveryType) {
+    ItchBuilder b;
+    b.add_order(1, 100, 1, 'B', 10, "AAPL", 1'000'000);
+    b.add_order_mpid(1, 100, 2, 'B', 10, "AAPL", 1'000'000, "NSDQ");
+    b.order_cancel(1, 100, 1, 5);
+    b.order_delete(1, 100, 1);
+    b.order_executed(1, 100, 1, 5, 900);
+    b.order_executed_price(1, 100, 1, 5, 900, 'Y', 1'000'000);
+    b.order_replace(1, 100, 1, 2, 10, 1'000'000);
+    auto in = b.stream();
+    ItchReader reader(in);
+    int checked = 0;
+    while (const auto frame = reader.next()) {
+        const char type = std::to_integer<char>(frame->data[0]);
+        try {
+            decode_book_message(frame->data, frame->size - 1);
+            FAIL() << "expected FeedError for type " << type;
+        } catch (const FeedError& e) {
+            EXPECT_EQ(e.message_type(), type);
+            EXPECT_NE(e.reason().find("body length"), std::string::npos);
+        }
+        ++checked;
+    }
+    EXPECT_EQ(checked, 7);
+}
+
+TEST(Decode, BadSideByteThrows) {
+    ItchBuilder b;
+    b.add_order(1, 100, 1, 'Q', 10, "AAPL", 1'000'000);  // side neither B nor S
+    auto in = b.stream();
+    ItchReader reader(in);
+    const auto frame = reader.next();
+    ASSERT_TRUE(frame.has_value());
+    try {
+        decode_book_message(frame->data, frame->size);
+        FAIL() << "expected FeedError";
+    } catch (const FeedError& e) {
+        EXPECT_EQ(e.message_type(), 'A');
+        EXPECT_NE(e.reason().find("side"), std::string::npos);
+    }
+}
+
+TEST(Decode, NonBookTypeThrows) {
+    ItchBuilder b;
+    b.stock_directory(1, 100, "AAPL");
+    auto in = b.stream();
+    ItchReader reader(in);
+    const auto frame = reader.next();
+    ASSERT_TRUE(frame.has_value());
+    EXPECT_THROW(decode_book_message(frame->data, frame->size), FeedError);
 }
 
 }  // namespace
