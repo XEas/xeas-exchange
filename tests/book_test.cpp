@@ -803,4 +803,44 @@ TEST(ReplaceEvent, SamePriceAloneAtLevelRecreatesLevel) {
     EXPECT_TRUE(book_consistent(book));
 }
 
+// ---------------------------------------------------------------------------
+// Milestone 2 additive: is_crossed() — O(1) crossed/locked probe
+// ---------------------------------------------------------------------------
+
+TEST(IsCrossed, EmptyBookIsNotCrossed) {
+    Book book;
+    EXPECT_FALSE(is_crossed(book));
+}
+
+TEST(IsCrossed, OneSidedBookIsNotCrossed) {
+    Book bids_only;
+    apply(bids_only, make_add(1, Side::Bid, 1'000'000, 100));
+    EXPECT_FALSE(is_crossed(bids_only));
+
+    Book asks_only;
+    apply(asks_only, make_add(2, Side::Ask, 1'000'000, 100));
+    EXPECT_FALSE(is_crossed(asks_only));
+}
+
+TEST(IsCrossed, NormalSpreadIsNotCrossed) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_add(2, Side::Ask, 1'000'100, 100));
+    EXPECT_FALSE(is_crossed(book));
+}
+
+TEST(IsCrossed, LockedBookIsCrossed) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_add(2, Side::Ask, 1'000'000, 100));
+    EXPECT_TRUE(is_crossed(book));
+}
+
+TEST(IsCrossed, CrossedBookIsCrossed) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'100, 100));
+    apply(book, make_add(2, Side::Ask, 1'000'000, 100));
+    EXPECT_TRUE(is_crossed(book));
+}
+
 }  // namespace

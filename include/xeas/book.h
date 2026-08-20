@@ -101,4 +101,10 @@ void apply(Book& book, const Event& event);
 // violated invariant; an empty vector means the book is consistent.
 std::vector<std::string> check_invariants(const Book& book);
 
+// True iff both sides are non-empty and best bid >= best ask (locked or
+// crossed). O(1). Milestone 2's replay driver probes this after every event
+// to classify crossed/locked books as data reality (halts, opening/closing
+// crosses) without string-matching check_invariants() output.
+bool is_crossed(const Book& book);
+
 }  // namespace xeas

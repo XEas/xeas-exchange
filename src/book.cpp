@@ -251,4 +251,12 @@ std::vector<std::string> check_invariants(const Book& book) {
     return violations;
 }
 
+// --- is_crossed ------------------------------------------------------------
+
+bool is_crossed(const Book& book) {
+    const auto bid = book.best_bid();
+    const auto ask = book.best_ask();
+    return bid.has_value() && ask.has_value() && bid->price >= ask->price;
+}
+
 }  // namespace xeas
