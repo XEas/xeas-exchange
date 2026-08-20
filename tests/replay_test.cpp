@@ -155,4 +155,120 @@ TEST(Replay, ProgressLinesAndQuiet) {
     EXPECT_TRUE(log2.str().empty());  // 0 = silent
 }
 
+// ---------------------------------------------------------------------------
+// Replay: crossed classification and abort semantics
+// ---------------------------------------------------------------------------
+
+TEST(Replay, CrossedTapeCompletesAndCountsEpisodes) {
+    ItchBuilder b;
+    b.stock_directory(1, 50, "AAPL");
+    b.add_order(1, 100, 1, 'B', 10, "AAPL", 1'000'000);
+    b.add_order(1, 110, 2, 'S', 10, "AAPL", 1'005'000);  // normal spread
+    b.add_order(1, 120, 3, 'S', 10, "AAPL", 995'000);    // crossed: episode 1
+    b.order_delete(1, 130, 3);                           // uncrossed
+    b.add_order(1, 140, 4, 'S', 10, "AAPL", 1'000'000);  // locked: episode 2
+    BookRouter router;
+    std::ostringstream log;
+    // Sweep after every message: the crossed book is seen by sweeps too —
+    // logged once, never fatal.
+    const ReplayStats stats = run(b, router, ReplayOptions{1, 0}, &log);
+    EXPECT_EQ(stats.crossed_episodes, 2u);
+    EXPECT_EQ(stats.crossed_symbols, 1u);
+    EXPECT_EQ(stats.events_applied, 5u);  // completed without throwing
+    const std::string text = log.str();
+    EXPECT_NE(text.find("AAPL"), std::string::npos);
+    EXPECT_NE(text.find("crossed"), std::string::npos);
+    EXPECT_EQ(text.find("crossed"), text.rfind("crossed"));  // logged exactly once
+}
+
+TEST(Replay, CrossedThenUncrossedFinalSweepStaysQuiet) {
+    ItchBuilder b;
+    b.add_order(1, 100, 1, 'B', 10, "AAPL", 1'000'000);
+    b.add_order(1, 110, 2, 'S', 10, "AAPL", 995'000);  // crossed
+    b.order_delete(1, 120, 2);                         // uncrossed before EOF
+    BookRouter router;
+    std::ostringstream log;
+    const ReplayStats stats = run(b, router, ReplayOptions{0, 0}, &log);
+    EXPECT_EQ(stats.crossed_episodes, 1u);   // probe caught it mid-tape
+    EXPECT_EQ(stats.crossed_symbols, 1u);
+    EXPECT_TRUE(log.str().empty());          // final sweep saw a clean book
+}
+
+TEST(Replay, BookErrorPropagatesWithStatsIntact) {
+    ItchBuilder b;
+    b.add_order(1, 100, 1, 'B', 10, "AAPL", 1'000'000);
+    b.order_cancel(1, 110, 999, 5);  // unknown order id -> BookError
+    b.add_order(1, 120, 2, 'B', 10, "AAPL", 1'000'000);  // never reached
+    BookRouter router;
+    auto in = b.stream();
+    ItchReader reader(in);
+    ReplayStats stats;
+    std::ostringstream log;
+    const ReplayOptions opts{0, 0};
+    EXPECT_THROW(replay_stream(reader, router, opts, stats, log), BookError);
+    EXPECT_EQ(stats.messages_total, 2u);
+    EXPECT_EQ(stats.count_by_type[static_cast<unsigned char>('A')], 1u);
+    EXPECT_EQ(stats.count_by_type[static_cast<unsigned char>('X')], 1u);
+    EXPECT_EQ(stats.events_applied, 1u);
+    EXPECT_EQ(stats.books_created, 1u);
+    EXPECT_EQ(stats.live_orders_final, 1u);
+    EXPECT_GT(stats.bytes_consumed, 0u);
+}
+
+TEST(Replay, TruncatedStreamMidTapeThrowsFeedError) {
+    ItchBuilder b;
+    b.add_order(1, 100, 1, 'B', 10, "AAPL", 1'000'000);
+    b.add_order(1, 110, 2, 'B', 10, "AAPL", 1'000'100);
+    b.truncate_last(4);
+    BookRouter router;
+    auto in = b.stream();
+    ItchReader reader(in);
+    ReplayStats stats;
+    std::ostringstream log;
+    const ReplayOptions opts{0, 0};
+    EXPECT_THROW(replay_stream(reader, router, opts, stats, log), FeedError);
+    EXPECT_EQ(stats.messages_total, 1u);  // first message processed fine
+    EXPECT_EQ(stats.events_applied, 1u);
+}
+
+TEST(Replay, DecodeErrorEnrichedWithStreamPosition) {
+    ItchBuilder b;
+    b.add_order(1, 100, 1, 'B', 10, "AAPL", 1'000'000);   // frame 0: 38 bytes
+    b.add_order(1, 110, 2, 'Q', 10, "AAPL", 1'000'100);   // bad side byte
+    BookRouter router;
+    auto in = b.stream();
+    ItchReader reader(in);
+    ReplayStats stats;
+    std::ostringstream log;
+    const ReplayOptions opts{0, 0};
+    try {
+        replay_stream(reader, router, opts, stats, log);
+        FAIL() << "expected FeedError";
+    } catch (const FeedError& e) {
+        EXPECT_EQ(e.byte_offset(), 38u);   // start of the offending frame
+        EXPECT_EQ(e.message_index(), 1u);
+        EXPECT_EQ(e.message_type(), 'A');
+        EXPECT_NE(e.reason().find("side"), std::string::npos);
+    }
+}
+
+TEST(Replay, ReplayErrorCarriesContext) {
+    // A structural violation cannot be produced through well-formed replay
+    // (that is the point); checker correctness is Milestone 1's job. Verify
+    // the exception type's contract directly.
+    const ReplayError e(42, "AAPL",
+                        {"bid level 100 is empty", "order index size 2 != orders present in levels 1"},
+                        1234);
+    EXPECT_EQ(e.locate(), 42);
+    EXPECT_EQ(e.symbol(), "AAPL");
+    EXPECT_EQ(e.violations().size(), 2u);
+    EXPECT_EQ(e.message_index(), 1234u);
+    const std::string what = e.what();
+    EXPECT_NE(what.find("AAPL"), std::string::npos);
+    EXPECT_NE(what.find("42"), std::string::npos);
+    EXPECT_NE(what.find("1234"), std::string::npos);
+    EXPECT_NE(what.find("bid level 100 is empty"), std::string::npos);
+    EXPECT_NE(what.find("order index size"), std::string::npos);
+}
+
 }  // namespace
