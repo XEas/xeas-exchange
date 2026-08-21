@@ -32,11 +32,15 @@ replaying the same events always produces the same book (deterministic).
 ## Architecture
 
 ```
-ITCH file → [Decoder] → [Normalizer] → Event → [Book core] → queries / stats
+ITCH file → [Decoder/Normalizer] → Event → [Book core] → queries / stats
 ```
 
-- **Decoder** — parses ITCH binary messages (venue-specific, no logic)
-- **Normalizer** — converts to canonical `Event` (venue quirks end here)
+- **Decoder/Normalizer** — fused: for ITCH the normalization is nearly the
+  identity (`'B'/'S'` → `Side`, drop MPID, widen price/timestamp), so a typed
+  per-message struct layer would be pure transcription. The split survives as
+  a knowledge boundary: `src/itch.cpp` is the only code that knows ITCH byte
+  layouts, and its output is the canonical `Event`. A future second venue adds
+  its own `decode_*` producing the same `Event`.
 - **Book core** — pure `apply(Book&, Event)`; no I/O, no clocks, fully testable
 
 ## Milestones

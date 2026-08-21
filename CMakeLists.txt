@@ -13,6 +13,22 @@ if(NOT MSVC)
   target_compile_options(xeas_core PRIVATE -Wall -Wextra)
 endif()
 
+# --- feed library (Milestone 2) ----------------------------------------------
+# Separate target so layering is enforced at link level: the book core never
+# sees feed or I/O code, and Milestone 3 benchmarks can link book-only.
+add_library(xeas_feed src/itch.cpp src/router.cpp src/replay.cpp)
+target_link_libraries(xeas_feed PUBLIC xeas_core)
+if(NOT MSVC)
+  target_compile_options(xeas_feed PRIVATE -Wall -Wextra)
+endif()
+
+# --- itch_replay CLI (Milestone 2) -------------------------------------------
+add_executable(itch_replay src/itch_replay_main.cpp)
+target_link_libraries(itch_replay PRIVATE xeas_feed)
+if(NOT MSVC)
+  target_compile_options(itch_replay PRIVATE -Wall -Wextra)
+endif()
+
 # --- tests -------------------------------------------------------------------
 enable_testing()
 
@@ -32,5 +48,19 @@ if(NOT MSVC)
   target_compile_options(book_test PRIVATE -Wall -Wextra)
 endif()
 
+add_executable(itch_test tests/itch_test.cpp)
+target_link_libraries(itch_test PRIVATE xeas_feed GTest::gtest_main)
+if(NOT MSVC)
+  target_compile_options(itch_test PRIVATE -Wall -Wextra)
+endif()
+
+add_executable(replay_test tests/replay_test.cpp)
+target_link_libraries(replay_test PRIVATE xeas_feed GTest::gtest_main)
+if(NOT MSVC)
+  target_compile_options(replay_test PRIVATE -Wall -Wextra)
+endif()
+
 include(GoogleTest)
 gtest_discover_tests(book_test)
+gtest_discover_tests(itch_test)
+gtest_discover_tests(replay_test)
