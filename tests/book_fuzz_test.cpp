@@ -155,4 +155,160 @@ TEST(TapeGen, FarPricesAppearAtConfiguredRate) {
     EXPECT_GT(far_seen, 0);
 }
 
+// ---------------------------------------------------------------------------
+// Differential protocol (spec §6): apply each event to both books; compare
+// queries every K events and exhaustively at the end; require the new book's
+// invariants to be empty or crossed-only.
+// ---------------------------------------------------------------------------
+
+template <class B>
+std::optional<BBO> best_of(const B& book, Side side) {
+    return side == Side::Bid ? book.best_bid() : book.best_ask();
+}
+
+template <class NewBook, class OracleBook>
+testing::AssertionResult books_agree(const NewBook& book, const OracleBook& oracle,
+                                     const std::vector<Price>& prices,
+                                     const std::vector<OrderId>& ids) {
+    for (const Side side : {Side::Bid, Side::Ask}) {
+        const char* name = side == Side::Bid ? "bid" : "ask";
+        const auto a = best_of(book, side);
+        const auto b = best_of(oracle, side);
+        if (a.has_value() != b.has_value()) {
+            return testing::AssertionFailure() << "best " << name << " presence differs";
+        }
+        if (a.has_value() && (a->price != b->price || a->total_shares != b->total_shares)) {
+            return testing::AssertionFailure()
+                   << "best " << name << " differs: " << a->price << "/" << a->total_shares
+                   << " vs " << b->price << "/" << b->total_shares;
+        }
+        if (book.level_count(side) != oracle.level_count(side)) {
+            return testing::AssertionFailure()
+                   << name << " level_count differs: " << book.level_count(side) << " vs "
+                   << oracle.level_count(side);
+        }
+        for (const Price price : prices) {
+            if (book.size_at(side, price) != oracle.size_at(side, price)) {
+                return testing::AssertionFailure()
+                       << name << " size_at " << price << " differs: "
+                       << book.size_at(side, price) << " vs " << oracle.size_at(side, price);
+            }
+        }
+    }
+    if (book.order_count() != oracle.order_count()) {
+        return testing::AssertionFailure() << "order_count differs: " << book.order_count()
+                                           << " vs " << oracle.order_count();
+    }
+    for (const OrderId id : ids) {
+        const auto a = book.find_order(id);
+        const auto b = oracle.find_order(id);
+        if (a.has_value() != b.has_value()) {
+            return testing::AssertionFailure() << "find_order presence differs for id " << id;
+        }
+        if (a.has_value() && (a->side != b->side || a->price != b->price ||
+                              a->remaining_qty != b->remaining_qty)) {
+            return testing::AssertionFailure() << "find_order differs for id " << id;
+        }
+    }
+    return testing::AssertionSuccess();
+}
+
+testing::AssertionResult crossed_only(const std::vector<std::string>& violations) {
+    for (const auto& v : violations) {
+        if (v.find("crossed") == std::string::npos) {
+            return testing::AssertionFailure() << "non-crossed invariant violation: " << v;
+        }
+    }
+    return testing::AssertionSuccess();
+}
+
+template <class NewBook, class OracleBook>
+void run_differential(const TapeGenOptions& opts, std::size_t events, std::size_t check_every) {
+    NewBook book;
+    OracleBook oracle;
+    TapeGen gen(opts);
+    std::vector<Price> touched;       // every Add/Replace price, for the final sweep
+    std::array<Price, 16> recent{};   // ring of recently touched prices
+    std::size_t recent_n = 0;
+    for (std::size_t i = 0; i < events; ++i) {
+        const Event e = gen.next();
+        apply(book, e);
+        apply(oracle, e);
+        if (e.type == EventType::Add || e.type == EventType::Replace) {
+            touched.push_back(e.price);
+            recent[recent_n++ % recent.size()] = e.price;
+        }
+        if ((i + 1) % check_every == 0) {
+            const std::vector<Price> prices(
+                recent.begin(),
+                recent.begin() + static_cast<std::ptrdiff_t>(std::min(recent_n, recent.size())));
+            std::vector<OrderId> sample;
+            const auto& live = gen.live_order_ids();
+            for (std::size_t k = 0; k < live.size(); k += 97) sample.push_back(live[k]);
+            ASSERT_TRUE(books_agree(book, oracle, prices, sample)) << "after event " << i + 1;
+            ASSERT_TRUE(crossed_only(check_invariants(book))) << "after event " << i + 1;
+        }
+    }
+    // Final sweeps: every live order, every touched price.
+    std::sort(touched.begin(), touched.end());
+    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+    ASSERT_TRUE(books_agree(book, oracle, touched, gen.live_order_ids())) << "final sweep";
+    ASSERT_TRUE(crossed_only(check_invariants(book))) << "final sweep";
+}
+
+// ---------------------------------------------------------------------------
+// FuzzDifferential: Book vs the frozen BaselineBook oracle
+// ---------------------------------------------------------------------------
+
+TEST(FuzzDifferential, DefaultMixAgainstBaseline) {
+    TapeGenOptions opts;
+    opts.seed = 1;
+    run_differential<Book, BaselineBook>(opts, 100'000, 4'096);
+}
+
+TEST(FuzzDifferential, ReplaceHeavyMix) {
+    TapeGenOptions opts;
+    opts.seed = 2;
+    opts.add = 300; opts.del = 100; opts.execute = 100; opts.cancel = 100; opts.replace = 400;
+    run_differential<Book, BaselineBook>(opts, 100'000, 4'096);
+}
+
+TEST(FuzzDifferential, FarPriceHeavyMix) {
+    TapeGenOptions opts;
+    opts.seed = 3;
+    opts.far_price_ppm = 20'000;   // 2% far-out prices: overflow and overflow-is-best
+    run_differential<Book, BaselineBook>(opts, 100'000, 4'096);
+}
+
+TEST(FuzzDifferential, HighChurnDrainsToEmpty) {
+    TapeGenOptions opts;
+    opts.seed = 4;
+    opts.add = 250; opts.del = 450; opts.execute = 200; opts.cancel = 50; opts.replace = 50;
+    run_differential<Book, BaselineBook>(opts, 100'000, 4'096);
+}
+
+TEST(FuzzDifferential, CrossedHeavyMix) {
+    TapeGenOptions opts;
+    opts.seed = 5;
+    opts.offset_max = 2;   // both sides hug the mid: constant locking/crossing
+    opts.walk_step = 5;
+    run_differential<Book, BaselineBook>(opts, 100'000, 4'096);
+}
+
+TEST(FuzzDifferential, MultiSeedSweep) {
+    for (std::uint64_t seed = 2; seed <= 11; ++seed) {
+        TapeGenOptions opts;
+        opts.seed = seed;
+        run_differential<Book, BaselineBook>(opts, 20'000, 4'096);
+        if (::testing::Test::HasFatalFailure()) FAIL() << "seed " << seed;
+    }
+}
+
+TEST(FuzzDifferential, BaselineAgreesWithItself) {
+    // Harness self-validation: the oracle differentially compared to itself.
+    TapeGenOptions opts;
+    opts.seed = 1;
+    run_differential<BaselineBook, BaselineBook>(opts, 50'000, 4'096);
+}
+
 }  // namespace
