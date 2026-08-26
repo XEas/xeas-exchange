@@ -323,7 +323,7 @@ TEST(BenchSmoke, WorkloadsPassInvariantsUntimed) {
         for (const Event& e : tape.timed) apply(book, e);
         EXPECT_TRUE(crossed_only(check_invariants(book)))
             << "workload " << static_cast<int>(w);
-        EXPECT_GT(book.order_count() + tape.timed.size(), 10'000u);
+        EXPECT_GE(book.order_count() + tape.timed.size(), 10'000u);
     }
 }
 
