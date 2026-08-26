@@ -149,4 +149,80 @@ private:
     std::vector<Qty> remaining_;
 };
 
+// --- bench workloads (spec §2), shared by book_bench and BenchSmoke -----------
+
+enum class Workload { Steady, Insert, Deep };
+
+struct WorkloadTape {
+    std::vector<Event> warm;    // applied untimed (book warm-up)
+    std::vector<Event> timed;   // the measured batch
+};
+
+inline constexpr std::size_t kSteadyWarmOrders = 100'000;
+
+inline WorkloadTape make_workload_tape(Workload workload, std::uint64_t seed,
+                                       std::size_t warmup_events,
+                                       std::size_t timed_events) {
+    WorkloadTape tape;
+    TapeGenOptions mix;   // ITCH-like steady mix (the defaults)
+    mix.seed = seed;
+
+    TapeGenOptions adds_only = mix;
+    adds_only.add = 1'000;
+    adds_only.del = adds_only.execute = adds_only.cancel = adds_only.replace = 0;
+    adds_only.far_price_ppm = 0;
+
+    switch (workload) {
+    case Workload::Steady: {
+        // Warm the book to ~100k live orders, then an ITCH-like mix around a
+        // random-walking mid: the real replay hot path — the flagship number.
+        TapeGen gen(adds_only);
+        tape.warm.reserve(kSteadyWarmOrders + warmup_events);
+        for (std::size_t i = 0; i < kSteadyWarmOrders; ++i) tape.warm.push_back(gen.next());
+        gen.set_options(mix);
+        for (std::size_t i = 0; i < warmup_events; ++i) tape.warm.push_back(gen.next());
+        tape.timed.reserve(timed_events);
+        for (std::size_t i = 0; i < timed_events; ++i) tape.timed.push_back(gen.next());
+        break;
+    }
+    case Workload::Insert: {
+        // Adds spread across many levels, then delete them all: level
+        // create/destroy and price-structure insert pressure. No warm phase;
+        // warmup_events is ignored — the churn IS the workload.
+        TapeGenOptions wide_adds = adds_only;
+        wide_adds.offset_max = 50'000;
+        TapeGen gen(wide_adds);
+        const std::size_t adds = (timed_events + 1) / 2;
+        tape.timed.reserve(timed_events);
+        for (std::size_t i = 0; i < adds; ++i) tape.timed.push_back(gen.next());
+        TapeGenOptions deletes_only = wide_adds;
+        deletes_only.add = 0;
+        deletes_only.del = 1'000;
+        gen.set_options(deletes_only);
+        for (std::size_t i = adds; i < timed_events; ++i) tape.timed.push_back(gen.next());
+        break;
+    }
+    case Workload::Deep: {
+        // Wide price range with occasional far-out prices: band growth, bitmap
+        // next-best scans, the overflow path.
+        TapeGenOptions deep = mix;
+        deep.walk_step = 500;
+        deep.offset_max = 20'000;
+        deep.far_price_ppm = 2'000;
+        TapeGenOptions deep_adds = adds_only;
+        deep_adds.walk_step = deep.walk_step;
+        deep_adds.offset_max = deep.offset_max;
+        TapeGen gen(deep_adds);
+        tape.warm.reserve(kSteadyWarmOrders + warmup_events);
+        for (std::size_t i = 0; i < kSteadyWarmOrders; ++i) tape.warm.push_back(gen.next());
+        gen.set_options(deep);
+        for (std::size_t i = 0; i < warmup_events; ++i) tape.warm.push_back(gen.next());
+        tape.timed.reserve(timed_events);
+        for (std::size_t i = 0; i < timed_events; ++i) tape.timed.push_back(gen.next());
+        break;
+    }
+    }
+    return tape;
+}
+
 }  // namespace xeas

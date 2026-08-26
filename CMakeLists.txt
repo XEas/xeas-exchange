@@ -41,6 +41,15 @@ if(NOT MSVC)
   target_compile_options(xeas_baseline PRIVATE -Wall -Wextra)
 endif()
 
+# --- book_bench (Milestone 3) --------------------------------------------------
+# Book-only: links xeas_core + xeas_baseline, NOT xeas_feed — cashing the
+# Milestone 2 promise that "benchmarks can link book-only".
+add_executable(book_bench bench/book_bench_main.cpp)
+target_link_libraries(book_bench PRIVATE xeas_core xeas_baseline)
+if(NOT MSVC)
+  target_compile_options(book_bench PRIVATE -Wall -Wextra)
+endif()
+
 # --- tests -------------------------------------------------------------------
 enable_testing()
 

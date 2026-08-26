@@ -311,4 +311,27 @@ TEST(FuzzDifferential, BaselineAgreesWithItself) {
     run_differential<BaselineBook, BaselineBook>(opts, 50'000, 4'096);
 }
 
+// ---------------------------------------------------------------------------
+// BenchSmoke: each bench workload runs untimed and leaves a consistent book
+// ---------------------------------------------------------------------------
+
+TEST(BenchSmoke, WorkloadsPassInvariantsUntimed) {
+    for (const Workload w : {Workload::Steady, Workload::Insert, Workload::Deep}) {
+        const WorkloadTape tape = make_workload_tape(w, 1, 1'000, 10'000);
+        Book book;
+        for (const Event& e : tape.warm) apply(book, e);
+        for (const Event& e : tape.timed) apply(book, e);
+        EXPECT_TRUE(crossed_only(check_invariants(book)))
+            << "workload " << static_cast<int>(w);
+        EXPECT_GT(book.order_count() + tape.timed.size(), 10'000u);
+    }
+}
+
+TEST(BenchSmoke, InsertWorkloadDrainsTheBook) {
+    const WorkloadTape tape = make_workload_tape(Workload::Insert, 1, 0, 10'000);
+    Book book;
+    for (const Event& e : tape.timed) apply(book, e);
+    EXPECT_EQ(book.order_count(), 0u);   // adds then deletes: exactly drains
+}
+
 }  // namespace
