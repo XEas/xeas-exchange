@@ -55,6 +55,12 @@ plus per-impl RSS runs with `--impl new` and `--impl baseline`.
 | 3 (banded flat array + bitmaps + overflow) | insert | new | 10.66 | 10.36 | 93.8 | 1.94x | 1354 [^comb] |
 | 3 (banded flat array + bitmaps + overflow) | deep | baseline | 2.75 | 2.10 | 363.8 | 1.00x | 1397 [^comb] |
 | 3 (banded flat array + bitmaps + overflow) | deep | new | 3.48 | 3.19 | 287.6 | 1.26x | 1397 [^comb] |
+| 4 (open-addressing order index) [^pwr4] | steady | baseline | 4.89 | 4.69 | 204.7 | 1.00x | 820 [^rss] |
+| 4 (open-addressing order index) | steady | new | 25.83 | 24.28 | 38.7 | 5.29x | 820 [^rss] |
+| 4 (open-addressing order index) | insert | baseline | 5.55 | 5.32 | 180.1 | 1.00x | 1249 [^comb] |
+| 4 (open-addressing order index) | insert | new | 27.30 | 22.78 | 36.6 | 4.92x | 1619 [^comb] |
+| 4 (open-addressing order index) | deep | baseline | 2.97 | 2.95 | 337.3 | 1.00x | 1619 [^comb] |
+| 4 (open-addressing order index) | deep | new | 6.04 | 4.45 | 165.5 | 2.04x | 1619 [^comb] |
 
 [^rss]: `steady` peak RSS is from the separate, clean per-impl runs
 (`--impl baseline` / `--impl new`, run in isolation) so the ~48 B/event tape
@@ -83,6 +89,12 @@ across the three runs (`pmset -g batt`: "Now drawing from 'Battery Power'",
 discharging) — the same non-AC, non-quiet-machine caveat as phases 1-2, and
 close to phase 2's starting point rather than phase 1's. No `min=0.01`
 sleep-artifact outliers were observed in the phase-3 runs.
+[^pwr4]: Phase-4 rows were measured on battery power, 91% draining to 90%
+across the three runs (`pmset -g batt`: "Now drawing from 'Battery Power'",
+discharging) — the same non-AC, non-quiet-machine caveat as phases 1-3. No
+`min=0.01` sleep-artifact outliers were observed in the phase-4 runs; all
+`min` values tracked their `median` closely (worst case `insert`/new,
+22.78 vs. 27.30 Mmsg/s).
 
 ## Macrobenchmark: full-day `itch_replay`
 
@@ -96,6 +108,12 @@ Command: `./build-release/itch_replay <day.NASDAQ_ITCH50> --quiet`
 end-to-end `itch_replay` msgs/s. Close ⇒ the book dominates and feed-side
 optimization stays out of scope; feed-dominant ⇒ a finding for a future
 milestone, not license to widen this one.
+
+**Status (through phase 4):** still pending. No real, uncompressed
+`*.NASDAQ_ITCH50` day file is available in this environment, so there is no
+macro row to fill and no book-vs-feed split to compute — that comparison
+awaits the same day file noted in the phase-1 macro row above. No numbers are
+invented here in its place.
 
 ## Band constants (phase 3 tuning)
 
