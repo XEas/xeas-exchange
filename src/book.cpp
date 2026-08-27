@@ -74,6 +74,8 @@ std::uint32_t scan_next(const std::vector<std::uint64_t>& words,
         for (;;) {
             if (in_summary != 0) {
                 const std::size_t word = sw * 64 + top_bit(in_summary);
+                // Defensive: same corrupted-book guard as scan_all.
+                if (word >= words.size() || words[word] == 0) return kNoOffset;
                 return static_cast<std::uint32_t>(word * 64 + top_bit(words[word]));
             }
             if (sw == 0) return kNoOffset;
@@ -90,6 +92,8 @@ std::uint32_t scan_next(const std::vector<std::uint64_t>& words,
             if (in_summary != 0) {
                 const std::size_t word =
                     sw * 64 + static_cast<std::size_t>(std::countr_zero(in_summary));
+                // Defensive: same corrupted-book guard as scan_all.
+                if (word >= words.size() || words[word] == 0) return kNoOffset;
                 return static_cast<std::uint32_t>(
                     word * 64 + static_cast<std::size_t>(std::countr_zero(words[word])));
             }

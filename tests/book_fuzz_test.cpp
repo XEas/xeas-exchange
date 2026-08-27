@@ -634,4 +634,12 @@ TEST(InvariantsV2, InBandPriceInOverflowIsFlagged) {
     EXPECT_TRUE(any_contains(check_invariants(book), "overflow contains in-band price"));
 }
 
+TEST(InvariantsV2, BitmapCorruptionAwayFromBestIsFlaggedWithoutCrashing) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'000'000, 100));   // best
+    apply(book, make_add(2, Side::Ask, 1'000'100, 50));    // worse level, different word
+    BookTestPeer::flip_tick_bit(book, Side::Ask, 1'000'100);
+    EXPECT_TRUE(any_contains(check_invariants(book), "bitmap disagrees"));
+}
+
 }  // namespace
