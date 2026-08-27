@@ -13,9 +13,48 @@
 #include <string_view>
 #include <vector>
 
+namespace xeas {
+
+// Test-only backdoor (friend of Book) for the fuzz binary. A sibling of the
+// peer in book_test.cpp — the two live in different binaries, so no ODR issue.
+struct BookTestPeer {
+    static std::uint32_t node_index(const Book& b, OrderId id) {
+        return b.orders_.at(id).node;
+    }
+    static std::size_t order_pool_capacity(const Book& b) { return b.order_pool_.capacity(); }
+    static std::size_t level_pool_capacity(const Book& b) { return b.level_pool_.capacity(); }
+    static std::vector<OrderId> level_order_ids(const Book& b, Side side, Price price) {
+        std::vector<OrderId> ids;
+        const std::uint32_t idx = b.level_index(side, price);
+        if (idx == Book::kNone) return ids;
+        for (std::uint32_t cur = b.level_pool_[idx].head; cur != Book::kNone;
+             cur = b.order_pool_[cur].next) {
+            ids.push_back(b.order_pool_[cur].id);
+        }
+        return ids;
+    }
+
+    // --- corruption helpers ---
+    static void set_order_free_head(Book& b, OrderId id) {   // node free AND in a level
+        b.order_pool_.free_head_ = b.orders_.at(id).node;
+    }
+    static void set_level_free_head(Book& b, Side side, Price price) {
+        b.level_pool_.free_head_ = b.level_index(side, price);
+    }
+    static void break_prev_link(Book& b, OrderId id) {   // corrupt a NON-head node
+        b.order_pool_[b.orders_.at(id).node].prev = Book::kNone;
+    }
+    static void corrupt_handle_level(Book& b, OrderId id, Side side, Price price) {
+        b.orders_.at(id).level = b.level_index(side, price);
+    }
+};
+
+}  // namespace xeas
+
 namespace {
 
 using namespace xeas;
+using xeas::BookTestPeer;
 
 // --- event factories (mirrors tests/book_test.cpp) --------------------------
 
@@ -332,6 +371,113 @@ TEST(BenchSmoke, InsertWorkloadDrainsTheBook) {
     Book book;
     for (const Event& e : tape.timed) apply(book, e);
     EXPECT_EQ(book.order_count(), 0u);   // adds then deletes: exactly drains
+}
+
+// ---------------------------------------------------------------------------
+// Pool: slab allocate/release/reuse, index stability, freelist honesty
+// ---------------------------------------------------------------------------
+
+TEST(Pool, ReleaseThenReallocateReusesTheSlot) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    const std::uint32_t first_slot = BookTestPeer::node_index(book, 1);
+    apply(book, make_delete(1));
+    apply(book, make_add(2, Side::Bid, 1'000'000, 50));
+    EXPECT_EQ(BookTestPeer::node_index(book, 2), first_slot);
+    EXPECT_EQ(BookTestPeer::order_pool_capacity(book), 1u);
+}
+
+TEST(Pool, CapacityStableUnderChurn) {
+    Book book;
+    for (int round = 0; round < 3; ++round) {
+        for (OrderId id = 1; id <= 100; ++id) {
+            apply(book, make_add(id + static_cast<OrderId>(round) * 1'000, Side::Bid,
+                                 1'000'000 - static_cast<Price>(id % 10) * 100, 10));
+        }
+        for (OrderId id = 1; id <= 100; ++id) {
+            apply(book, make_delete(id + static_cast<OrderId>(round) * 1'000));
+        }
+    }
+    EXPECT_EQ(BookTestPeer::order_pool_capacity(book), 100u);   // slots recycled
+    EXPECT_EQ(BookTestPeer::level_pool_capacity(book), 10u);
+    EXPECT_EQ(book.order_count(), 0u);
+    EXPECT_TRUE(check_invariants(book).empty());
+}
+
+TEST(Pool, HandlesStableAcrossSlabGrowth) {
+    Book book;
+    for (OrderId id = 1; id <= 5'000; ++id) {   // many vector reallocations
+        apply(book, make_add(id, Side::Bid, 1'000'000 - static_cast<Price>(id % 50), 10));
+    }
+    for (const OrderId id : {OrderId{1}, OrderId{2'500}, OrderId{5'000}}) {
+        const auto info = book.find_order(id);
+        ASSERT_TRUE(info.has_value()) << id;
+        EXPECT_EQ(info->price, 1'000'000 - static_cast<Price>(id % 50));
+        EXPECT_EQ(info->remaining_qty, 10u);
+    }
+    EXPECT_TRUE(check_invariants(book).empty());
+}
+
+TEST(Pool, FreelistCorruptionIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'010'000, 10));
+    apply(book, make_add(2, Side::Ask, 1'010'000, 20));
+    BookTestPeer::set_order_free_head(book, 2);
+    EXPECT_TRUE(any_contains(check_invariants(book), "freelist"));
+}
+
+TEST(Pool, FifoSurvivesHeavyChurn) {
+    Book book;
+    for (OrderId id = 1; id <= 50; ++id) {
+        apply(book, make_add(id, Side::Ask, 1'010'000, 10));
+    }
+    for (OrderId id = 1; id <= 50; id += 2) {
+        apply(book, make_delete(id));
+    }
+    std::vector<OrderId> expected;
+    for (OrderId id = 2; id <= 50; id += 2) expected.push_back(id);
+    EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Ask, 1'010'000), expected);
+    apply(book, make_add(51, Side::Ask, 1'010'000, 10));
+    expected.push_back(51);   // new order enqueues at the back
+    EXPECT_EQ(BookTestPeer::level_order_ids(book, Side::Ask, 1'010'000), expected);
+    EXPECT_TRUE(check_invariants(book).empty());
+}
+
+TEST(Pool, LevelPoolReusesReleasedLevels) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_delete(1));                          // level released
+    apply(book, make_add(2, Side::Bid, 990'000, 50));     // different price, same slot
+    EXPECT_EQ(BookTestPeer::level_pool_capacity(book), 1u);
+    EXPECT_EQ(book.best_bid()->price, 990'000);
+    EXPECT_TRUE(check_invariants(book).empty());
+}
+
+// ---------------------------------------------------------------------------
+// InvariantsV2 (phase-2 subset): one corruption per new structural invariant
+// ---------------------------------------------------------------------------
+
+TEST(InvariantsV2, BrokenPrevNextReciprocityIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_add(2, Side::Bid, 1'000'000, 50));   // id 2 is NOT the head
+    BookTestPeer::break_prev_link(book, 2);
+    EXPECT_TRUE(any_contains(check_invariants(book), "reciprocal"));
+}
+
+TEST(InvariantsV2, NodeOnFreelistAndInLevelIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    BookTestPeer::set_level_free_head(book, Side::Bid, 1'000'000);
+    EXPECT_TRUE(any_contains(check_invariants(book), "freelist"));
+}
+
+TEST(InvariantsV2, WrongLevelHandleIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'010'000, 100));
+    apply(book, make_add(2, Side::Ask, 1'020'000, 50));
+    BookTestPeer::corrupt_handle_level(book, 1, Side::Ask, 1'020'000);
+    EXPECT_TRUE(any_contains(check_invariants(book), "disagrees"));
 }
 
 }  // namespace
