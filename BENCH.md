@@ -26,7 +26,9 @@ and the commands below.
   reported "Now drawing from 'Battery Power'", 87%, discharging) rather than
   AC — not the quiet-machine ideal. Run-to-run median variance was visibly
   higher than expected as a result (e.g. `steady`/baseline median moved
-  between 3.31 and 4.80 Mmsg/s across invocations of differing command forms (the combined `--workload all` run vs the standalone per-impl run)); see footnote below the micro table.
+  between 3.31 and 4.80 Mmsg/s across invocations of differing command forms
+  (the combined `--workload all` run vs the standalone per-impl run)); see
+  footnote below the micro table.
 
 ## Microbenchmark: `book_bench`
 
