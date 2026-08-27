@@ -9,7 +9,6 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -116,7 +115,23 @@ private:
     };
     using BidSide = FlatSide<std::greater<>>;
     using AskSide = FlatSide<std::less<>>;
-    using OrderIndexMap = std::unordered_map<OrderId, OrderHandle>;
+
+    class OrderIndex {                 // flat open addressing, linear probe,
+    public:                            // Fibonacci-mixed key, backward-shift erase
+        OrderHandle* find(OrderId id);
+        const OrderHandle* find(OrderId id) const;
+        void insert(OrderId id, OrderHandle h);   // precondition: id absent
+        void erase(OrderId id);                   // precondition: id present
+        std::size_t size() const noexcept { return size_; }
+    private:
+        struct Slot { OrderId id; OrderHandle h; };  // empty <=> h.node == kNone
+        std::size_t home(OrderId id) const;
+        void rehash(std::size_t new_capacity);
+        std::vector<Slot> slots_;      // power-of-2 capacity; max load ~0.7
+        std::size_t size_ = 0;
+        friend std::vector<std::string> check_invariants(const Book& book);
+        friend struct BookTestPeer;
+    };
 
     // Band/overflow operations. Declared here, defined and only instantiated
     // in book.cpp.
@@ -143,7 +158,7 @@ private:
     // Create the level if needed, enqueue at the back (time priority), index the order.
     void insert_order(Side side, Price price, OrderId order_id, Qty quantity);
     // Unlink the order from its level, drop the level if it emptied, erase from the index.
-    void erase_order(OrderIndexMap::iterator index_it);
+    void erase_order(OrderId order_id, OrderHandle h);
     // The single ordered walker (strict best-first). Out-of-band only: used by
     // check_invariants and BookTestPeer, never on the hot path.
     void for_each_level(Side side,
@@ -153,7 +168,7 @@ private:
     LevelPool level_pool_;
     BidSide bids_;
     AskSide asks_;
-    OrderIndexMap orders_;
+    OrderIndex orders_;
 
     friend void apply(Book& book, const Event& event);
     friend std::vector<std::string> check_invariants(const Book& book);

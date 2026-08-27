@@ -9,8 +9,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <random>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace xeas {
@@ -19,7 +21,7 @@ namespace xeas {
 // peer in book_test.cpp — the two live in different binaries, so no ODR issue.
 struct BookTestPeer {
     static std::uint32_t node_index(const Book& b, OrderId id) {
-        return b.orders_.at(id).node;
+        return b.orders_.find(id)->node;
     }
     static std::size_t order_pool_capacity(const Book& b) { return b.order_pool_.capacity(); }
     static std::size_t level_pool_capacity(const Book& b) { return b.level_pool_.capacity(); }
@@ -36,16 +38,16 @@ struct BookTestPeer {
 
     // --- corruption helpers ---
     static void set_order_free_head(Book& b, OrderId id) {   // node free AND in a level
-        b.order_pool_.free_head_ = b.orders_.at(id).node;
+        b.order_pool_.free_head_ = b.orders_.find(id)->node;
     }
     static void set_level_free_head(Book& b, Side side, Price price) {
         b.level_pool_.free_head_ = b.level_index(side, price);
     }
     static void break_prev_link(Book& b, OrderId id) {   // corrupt a NON-head node
-        b.order_pool_[b.orders_.at(id).node].prev = Book::kNone;
+        b.order_pool_[b.orders_.find(id)->node].prev = Book::kNone;
     }
     static void corrupt_handle_level(Book& b, OrderId id, Side side, Price price) {
-        b.orders_.at(id).level = b.level_index(side, price);
+        b.orders_.find(id)->level = b.level_index(side, price);
     }
 
     // --- band accessors (phase 3) ---
@@ -84,6 +86,19 @@ struct BookTestPeer {
         if (side == Side::Bid) b.bids_.overflow.emplace(price, 0u);
         else b.asks_.overflow.emplace(price, 0u);
     }
+
+    // --- OrderIndex unit-test access (phase 4) ---
+    static Book::OrderIndex make_index() { return {}; }
+    static void index_insert(Book::OrderIndex& idx, OrderId id, std::uint32_t node) {
+        idx.insert(id, Book::OrderHandle{node, 0});
+    }
+    static std::uint32_t index_find_node(const Book::OrderIndex& idx, OrderId id) {
+        const auto* h = idx.find(id);
+        return h == nullptr ? Book::kNone : h->node;
+    }
+    static void index_erase(Book::OrderIndex& idx, OrderId id) { idx.erase(id); }
+    static std::size_t index_size(const Book::OrderIndex& idx) { return idx.size(); }
+    static constexpr std::uint32_t none() { return Book::kNone; }
 };
 
 }  // namespace xeas
@@ -640,6 +655,72 @@ TEST(InvariantsV2, BitmapCorruptionAwayFromBestIsFlaggedWithoutCrashing) {
     apply(book, make_add(2, Side::Ask, 1'000'100, 50));    // worse level, different word
     BookTestPeer::flip_tick_bit(book, Side::Ask, 1'000'100);
     EXPECT_TRUE(any_contains(check_invariants(book), "bitmap disagrees"));
+}
+
+// ---------------------------------------------------------------------------
+// OrderIndexUnit: open addressing, Fibonacci mix, backward-shift erase
+// ---------------------------------------------------------------------------
+
+TEST(OrderIndexUnit, MatchesReferenceMapUnderChurn) {
+    auto idx = BookTestPeer::make_index();
+    std::unordered_map<OrderId, std::uint32_t> reference;
+    std::vector<OrderId> live;
+    std::mt19937_64 rng(7);
+    OrderId next_id = 1;
+    for (int i = 0; i < 200'000; ++i) {
+        if (live.empty() || rng() % 100 < 55) {
+            const OrderId id = next_id++;   // near-sequential, like ITCH refs
+            BookTestPeer::index_insert(idx, id, static_cast<std::uint32_t>(id));
+            reference.emplace(id, static_cast<std::uint32_t>(id));
+            live.push_back(id);
+        } else {
+            const std::size_t v = rng() % live.size();
+            const OrderId id = live[v];
+            live[v] = live.back();
+            live.pop_back();
+            BookTestPeer::index_erase(idx, id);
+            reference.erase(id);
+        }
+    }
+    ASSERT_EQ(BookTestPeer::index_size(idx), reference.size());
+    for (const auto& [id, node] : reference) {
+        ASSERT_EQ(BookTestPeer::index_find_node(idx, id), node) << "id " << id;
+    }
+    for (OrderId id = next_id; id < next_id + 1'000; ++id) {
+        ASSERT_EQ(BookTestPeer::index_find_node(idx, id), BookTestPeer::none());
+    }
+}
+
+TEST(OrderIndexUnit, BackwardShiftKeepsClustersFindable) {
+    auto idx = BookTestPeer::make_index();
+    for (OrderId id = 1; id <= 3'000; ++id) {   // forces several rehashes
+        BookTestPeer::index_insert(idx, id, static_cast<std::uint32_t>(id));
+    }
+    for (OrderId id = 2; id <= 3'000; id += 2) {
+        BookTestPeer::index_erase(idx, id);
+    }
+    for (OrderId id = 1; id <= 3'000; ++id) {
+        if (id % 2 == 1) {
+            ASSERT_EQ(BookTestPeer::index_find_node(idx, id), static_cast<std::uint32_t>(id));
+        } else {
+            ASSERT_EQ(BookTestPeer::index_find_node(idx, id), BookTestPeer::none());
+        }
+    }
+    EXPECT_EQ(BookTestPeer::index_size(idx), 1'500u);
+}
+
+TEST(OrderIndexUnit, SizeTracksInsertsAndErases) {
+    auto idx = BookTestPeer::make_index();
+    EXPECT_EQ(BookTestPeer::index_size(idx), 0u);
+    EXPECT_EQ(BookTestPeer::index_find_node(idx, 1), BookTestPeer::none());  // empty table
+    BookTestPeer::index_insert(idx, 1, 10);
+    BookTestPeer::index_insert(idx, 2, 20);
+    EXPECT_EQ(BookTestPeer::index_size(idx), 2u);
+    EXPECT_EQ(BookTestPeer::index_find_node(idx, 1), 10u);
+    BookTestPeer::index_erase(idx, 1);
+    EXPECT_EQ(BookTestPeer::index_size(idx), 1u);
+    EXPECT_EQ(BookTestPeer::index_find_node(idx, 1), BookTestPeer::none());
+    EXPECT_EQ(BookTestPeer::index_find_node(idx, 2), 20u);
 }
 
 }  // namespace

@@ -95,7 +95,7 @@ struct BookTestPeer {
     }
 
     static void zero_order_qty(Book& b, OrderId id) {
-        b.order_pool_[b.orders_.at(id).node].remaining = 0;
+        b.order_pool_[b.orders_.find(id)->node].remaining = 0;
     }
 
     static void drop_from_index(Book& b, OrderId id) {
@@ -103,7 +103,7 @@ struct BookTestPeer {
     }
 
     static void corrupt_handle_level(Book& b, OrderId id, Side side, Price price) {
-        b.orders_.at(id).level = b.level_index(side, price);
+        b.orders_.find(id)->level = b.level_index(side, price);
     }
 };
 

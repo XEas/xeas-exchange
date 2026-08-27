@@ -13,6 +13,10 @@ constexpr std::size_t kMaxBandTicks = 262'144;
 // Mirrors Book::kNone (asserted equal in band_anchor).
 constexpr std::uint32_t kNoOffset = 0xFFFF'FFFFu;
 
+// Phase 4 flat order index (spec §3.3)
+constexpr std::size_t kIndexInitialCapacity = 1'024;
+constexpr std::uint64_t kFibMix = 0x9E37'79B9'7F4A'7C15ULL;
+
 inline void set_occupancy(std::vector<std::uint64_t>& words,
                           std::vector<std::uint64_t>& summary, std::size_t off) {
     words[off >> 6] |= (1ULL << (off & 63));
@@ -154,6 +158,91 @@ void Book::LevelPool::release(std::uint32_t idx) {
     levels_[idx].head = free_head_;
     levels_[idx].tail = kNone;
     free_head_ = idx;
+}
+
+// --- order index (spec §3.3) -----------------------------------------------------
+
+std::size_t Book::OrderIndex::home(OrderId id) const {
+    // Fibonacci mix, top bits: near-sequential ITCH order references spread
+    // uniformly; identity hashing would cluster catastrophically.
+    return static_cast<std::size_t>(
+        (id * kFibMix) >> (64 - std::countr_zero(slots_.size())));
+}
+
+Book::OrderHandle* Book::OrderIndex::find(OrderId id) {
+    if (slots_.empty()) {
+        return nullptr;
+    }
+    const std::size_t mask = slots_.size() - 1;
+    std::size_t i = home(id);
+    while (slots_[i].h.node != kNone) {
+        if (slots_[i].id == id) {
+            return &slots_[i].h;
+        }
+        i = (i + 1) & mask;
+    }
+    return nullptr;
+}
+
+const Book::OrderHandle* Book::OrderIndex::find(OrderId id) const {
+    return const_cast<OrderIndex*>(this)->find(id);
+}
+
+void Book::OrderIndex::insert(OrderId id, OrderHandle h) {
+    if (slots_.empty()) {
+        rehash(kIndexInitialCapacity);
+    } else if ((size_ + 1) * 10 > slots_.size() * 7) {   // max load ~0.7
+        rehash(slots_.size() * 2);
+    }
+    const std::size_t mask = slots_.size() - 1;
+    std::size_t i = home(id);
+    while (slots_[i].h.node != kNone) {
+        i = (i + 1) & mask;
+    }
+    slots_[i] = Slot{id, h};
+    ++size_;
+}
+
+void Book::OrderIndex::rehash(std::size_t new_capacity) {
+    std::vector<Slot> old = std::move(slots_);
+    slots_.assign(new_capacity, Slot{0, OrderHandle{kNone, kNone}});
+    for (const Slot& s : old) {
+        if (s.h.node == kNone) continue;
+        const std::size_t mask = slots_.size() - 1;
+        std::size_t i = home(s.id);
+        while (slots_[i].h.node != kNone) {
+            i = (i + 1) & mask;
+        }
+        slots_[i] = s;
+    }
+}
+
+void Book::OrderIndex::erase(OrderId id) {
+    if (slots_.empty()) {
+        return;   // precondition violated upstream; erase of absent id is a no-op
+    }
+    const std::size_t mask = slots_.size() - 1;
+    std::size_t hole = home(id);
+    while (slots_[hole].h.node != kNone && slots_[hole].id != id) {
+        hole = (hole + 1) & mask;
+    }
+    if (slots_[hole].h.node == kNone) {
+        return;
+    }
+    // Backward-shift deletion (no tombstones): any later cluster member whose
+    // probe path crosses the hole moves back into it.
+    std::size_t j = hole;
+    for (;;) {
+        j = (j + 1) & mask;
+        if (slots_[j].h.node == kNone) break;
+        const std::size_t h = home(slots_[j].id);
+        if (((j - h) & mask) >= ((j - hole) & mask)) {
+            slots_[hole] = slots_[j];
+            hole = j;
+        }
+    }
+    slots_[hole].h.node = kNone;
+    --size_;
 }
 
 // --- banded flat price structure (spec §3.1) -----------------------------------
@@ -328,12 +417,12 @@ std::int64_t Book::size_at(Side side, Price price) const {
 }
 
 std::optional<OrderInfo> Book::find_order(OrderId order_id) const {
-    const auto it = orders_.find(order_id);
-    if (it == orders_.end()) {
+    const OrderHandle* h = orders_.find(order_id);
+    if (h == nullptr) {
         return std::nullopt;
     }
-    const OrderNode& node = order_pool_[it->second.node];
-    const Level& level = level_pool_[it->second.level];
+    const OrderNode& node = order_pool_[h->node];
+    const Level& level = level_pool_[h->level];
     return OrderInfo{level.side, level.price, node.remaining};
 }
 
@@ -372,11 +461,10 @@ void Book::insert_order(Side side, Price price, OrderId order_id, Qty quantity) 
     }
     level.tail = node_idx;
     level.total_shares += static_cast<std::int64_t>(quantity);
-    orders_.emplace(order_id, OrderHandle{node_idx, level_idx});
+    orders_.insert(order_id, OrderHandle{node_idx, level_idx});
 }
 
-void Book::erase_order(OrderIndexMap::iterator index_it) {
-    const OrderHandle h = index_it->second;
+void Book::erase_order(OrderId order_id, OrderHandle h) {
     const OrderNode node = order_pool_[h.node];  // copy: the slot is released below
     Level& level = level_pool_[h.level];
     level.total_shares -= static_cast<std::int64_t>(node.remaining);
@@ -392,7 +480,6 @@ void Book::erase_order(OrderIndexMap::iterator index_it) {
     }
     order_pool_.release(h.node);
     if (level.head == kNone) {
-        // No empty levels ever: drop the level immediately (O(log levels)).
         if (level.side == Side::Bid) {
             side_erase(bids_, level.price);
         } else {
@@ -400,7 +487,7 @@ void Book::erase_order(OrderIndexMap::iterator index_it) {
         }
         level_pool_.release(h.level);
     }
-    orders_.erase(index_it);
+    orders_.erase(order_id);
 }
 
 // --- apply ---------------------------------------------------------------------
@@ -417,7 +504,7 @@ void apply(Book& book, const Event& event) {
         if (event.price <= 0) {
             throw BookError(event, "Add: non-positive price");
         }
-        if (book.orders_.count(event.order_id) != 0) {
+        if (book.orders_.find(event.order_id) != nullptr) {
             throw BookError(event, "Add: order_id already exists");
         }
         book.insert_order(event.side, event.price, event.order_id, event.quantity);
@@ -428,22 +515,22 @@ void apply(Book& book, const Event& event) {
         // Identical book effect (spec section 2); Execute is distinct only for
         // later trade stats. Execution price never affects book state.
         const char* const name = (event.type == EventType::Cancel) ? "Cancel" : "Execute";
-        const auto index_it = book.orders_.find(event.order_id);
-        if (index_it == book.orders_.end()) {
+        Book::OrderHandle* handle = book.orders_.find(event.order_id);
+        if (handle == nullptr) {
             throw BookError(event, std::string(name) + ": unknown order_id");
         }
         if (event.quantity == 0) {
             throw BookError(event, std::string(name) + ": zero quantity");
         }
-        Book::OrderNode& node = book.order_pool_[index_it->second.node];
+        Book::OrderNode& node = book.order_pool_[handle->node];
         if (event.quantity > node.remaining) {
             throw BookError(event, std::string(name) + ": quantity exceeds remaining shares");
         }
         if (event.quantity == node.remaining) {
-            book.erase_order(index_it);  // reaches zero: removed immediately
+            book.erase_order(event.order_id, *handle);  // reaches zero: removed immediately
         } else {
             node.remaining -= event.quantity;
-            book.level_pool_[index_it->second.level].total_shares -=
+            book.level_pool_[handle->level].total_shares -=
                 static_cast<std::int64_t>(event.quantity);
         }
         break;
@@ -451,22 +538,22 @@ void apply(Book& book, const Event& event) {
     case EventType::Delete: {
         // Remove entirely, whatever the remaining quantity; event.quantity and
         // event.price are ignored by definition (spec section 2).
-        const auto index_it = book.orders_.find(event.order_id);
-        if (index_it == book.orders_.end()) {
+        const Book::OrderHandle* handle = book.orders_.find(event.order_id);
+        if (handle == nullptr) {
             throw BookError(event, "Delete: unknown order_id");
         }
-        book.erase_order(index_it);
+        book.erase_order(event.order_id, *handle);
         break;
     }
     case EventType::Replace: {
-        const auto index_it = book.orders_.find(event.order_id);
-        if (index_it == book.orders_.end()) {
+        const Book::OrderHandle* handle = book.orders_.find(event.order_id);
+        if (handle == nullptr) {
             throw BookError(event, "Replace: unknown order_id");
         }
         // order_id is live, so the count() check alone also catches
         // new_order_id == order_id; the explicit test documents the spec.
         if (event.new_order_id == event.order_id ||
-            book.orders_.count(event.new_order_id) != 0) {
+            book.orders_.find(event.new_order_id) != nullptr) {
             throw BookError(event, "Replace: new_order_id already exists");
         }
         if (event.quantity == 0) {
@@ -480,8 +567,8 @@ void apply(Book& book, const Event& event) {
         // level's queue — time priority is lost (ITCH semantics).
         // All validation passed above; neither call below can fail validation
         // (allocation failure aside — post-throw state is unspecified, spec section 4).
-        const Side side = book.level_pool_[index_it->second.level].side;
-        book.erase_order(index_it);
+        const Side side = book.level_pool_[handle->level].side;
+        book.erase_order(event.order_id, *handle);
         book.insert_order(side, event.price, event.new_order_id, event.quantity);
         break;
     }
@@ -596,12 +683,12 @@ std::vector<std::string> check_invariants(const Book& book) {
                 sum += static_cast<std::int64_t>(node.remaining);
                 // Invariant 5 (level -> index): every order in a level is indexed,
                 // and its handle points at exactly this node in this level.
-                const auto idx = book.orders_.find(node.id);
-                if (idx == book.orders_.end()) {
+                const Book::OrderHandle* handle = book.orders_.find(node.id);
+                if (handle == nullptr) {
                     violations.push_back("order " + std::to_string(node.id) + " in " + name +
                                          " level " + std::to_string(price) +
                                          " missing from index");
-                } else if (idx->second.node != cur || idx->second.level != level_idx) {
+                } else if (handle->node != cur || handle->level != level_idx) {
                     violations.push_back("index entry for order " + std::to_string(node.id) +
                                          " disagrees with its level");
                 }
@@ -637,6 +724,22 @@ std::vector<std::string> check_invariants(const Book& book) {
         violations.push_back("order index size " + std::to_string(book.orders_.size()) +
                              " != orders present in levels " +
                              std::to_string(orders_in_levels));
+    }
+
+    // Phase-4 index self-check: every occupied slot must be reachable from its
+    // home position (backward-shift erase keeps probe chains gap-free).
+    std::size_t index_entries = 0;
+    for (const auto& slot : book.orders_.slots_) {
+        if (slot.h.node == Book::kNone) continue;
+        ++index_entries;
+        if (book.orders_.find(slot.id) != &slot.h) {
+            violations.push_back("index probe chain broken for order " +
+                                 std::to_string(slot.id));
+        }
+    }
+    if (index_entries != book.orders_.size()) {
+        violations.push_back("index occupied slots " + std::to_string(index_entries) +
+                             " != index size " + std::to_string(book.orders_.size()));
     }
 
     // Invariant 6: bitmaps agree with slots, summary agrees with words, and the
