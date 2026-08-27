@@ -43,6 +43,12 @@ plus per-impl RSS runs with `--impl new` and `--impl baseline`.
 | 1 (harness, baseline internals) | insert | new | 3.64 | 0.01 [^min] | 274.8 | 0.99x | 1512 [^comb] |
 | 1 (harness, baseline internals) | deep | baseline | 2.02 | 1.82 | 495.9 | 1.00x | 1512 [^comb] |
 | 1 (harness, baseline internals) | deep | new | 2.03 | 0.01 [^min] | 492.9 | 1.01x | 1512 [^comb] |
+| 2 (order pool + intrusive lists) [^pwr2] | steady | baseline | 4.34 | 4.02 | 230.3 | 1.00x | 820 [^rss] |
+| 2 (order pool + intrusive lists) | steady | new | 6.03 | 5.47 | 165.9 | 1.39x | 782 [^rss] |
+| 2 (order pool + intrusive lists) | insert | baseline | 5.37 | 5.32 | 186.1 | 1.00x | 1289 [^comb] |
+| 2 (order pool + intrusive lists) | insert | new | 6.27 | 6.10 | 159.4 | 1.17x | 1556 [^comb] |
+| 2 (order pool + intrusive lists) | deep | baseline | 2.66 | 2.09 | 376.1 | 1.00x | 1558 [^comb] |
+| 2 (order pool + intrusive lists) | deep | new | 2.73 | 2.56 | 365.8 | 1.03x | 1558 [^comb] |
 
 [^rss]: `steady` peak RSS is from the separate, clean per-impl runs
 (`--impl baseline` / `--impl new`, run in isolation) so the ~48 B/event tape
@@ -60,6 +66,12 @@ with `new`'s higher peak RSS — plausibly a first-touch page-fault /
 allocator-growth cost). Since phase-1 impls share the same internals per the
 milestone plan, this is flagged as a measurement finding to revisit once the
 impls diverge, not something papered over here.
+[^pwr2]: Phase-2 rows were measured on battery power at 100% (`pmset -g
+batt`: "Now drawing from 'Battery Power'", discharging), vs. 87% for phase
+1's measurements — a different point on the same (non-AC, non-quiet-machine)
+power state, noted per the Machine section's caveat above. No `min=0.01`
+sleep-artifact outliers were observed in the phase-2 runs (unlike phase 1's
+`new`/steady min, see [^min]).
 
 ## Macrobenchmark: full-day `itch_replay`
 
