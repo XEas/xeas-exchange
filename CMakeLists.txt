@@ -29,6 +29,27 @@ if(NOT MSVC)
   target_compile_options(itch_replay PRIVATE -Wall -Wextra)
 endif()
 
+# --- baseline oracle (Milestone 3) --------------------------------------------
+# FROZEN copy of the Milestone 1/2 book internals: reference oracle for the
+# bench and the fuzz differential. Linked ONLY by book_bench and book_fuzz_test
+# — never into xeas_core, xeas_feed, or itch_replay.
+add_library(xeas_baseline bench/baseline_book.cpp)
+target_include_directories(xeas_baseline PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+target_compile_features(xeas_baseline PUBLIC cxx_std_20)
+if(NOT MSVC)
+  target_compile_options(xeas_baseline PRIVATE -Wall -Wextra)
+endif()
+
+# --- book_bench (Milestone 3) --------------------------------------------------
+# Book-only: links xeas_core + xeas_baseline, NOT xeas_feed — cashing the
+# Milestone 2 promise that "benchmarks can link book-only".
+add_executable(book_bench bench/book_bench_main.cpp)
+target_link_libraries(book_bench PRIVATE xeas_core xeas_baseline)
+if(NOT MSVC)
+  target_compile_options(book_bench PRIVATE -Wall -Wextra)
+endif()
+
 # --- tests -------------------------------------------------------------------
 enable_testing()
 
@@ -60,7 +81,14 @@ if(NOT MSVC)
   target_compile_options(replay_test PRIVATE -Wall -Wextra)
 endif()
 
+add_executable(book_fuzz_test tests/book_fuzz_test.cpp)
+target_link_libraries(book_fuzz_test PRIVATE xeas_core xeas_baseline GTest::gtest_main)
+if(NOT MSVC)
+  target_compile_options(book_fuzz_test PRIVATE -Wall -Wextra)
+endif()
+
 include(GoogleTest)
 gtest_discover_tests(book_test)
 gtest_discover_tests(itch_test)
 gtest_discover_tests(replay_test)
+gtest_discover_tests(book_fuzz_test)

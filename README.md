@@ -17,7 +17,7 @@ event-sourced state machine. See [DESIGN.md](DESIGN.md) for the full design.
 |---|---|
 | 1. Book core — data structures, `apply()`, queries, invariant checker | ✅ done |
 | 2. ITCH replay — decode and replay a real trading day | ✅ done |
-| 3. Benchmark & optimize — measured swap to fast internals | planned |
+| 3. Benchmark & optimize — measured swap to fast internals | ✅ done |
 | 4. (Optional) live mode | planned |
 
 ## What's here (Milestone 1)
@@ -66,6 +66,19 @@ before/after numbers.
 - Tests use synthetic binary fixtures (`tests/itch_fixture.h`); no data files
   are checked in. A differential suite replays the same logical tape as binary
   and as direct `Event`s and requires every book query to agree.
+
+## What's here (Milestone 3)
+
+- **Milestone 3 — benchmark & optimize:** pooled intrusive levels, banded
+  bitmap price array, open-addressing order index behind the frozen `book.h`
+  API; before/after numbers per optimization in [BENCH.md](BENCH.md). Measured
+  steady-state replay workload ~5.29x over the Milestone 1 baseline book
+  (`book_bench --workload steady`, phase 4, `new` vs. `baseline`); a
+  `BaselineBook` oracle (`xeas_baseline`) and a differential fuzz harness keep
+  every rewrite honest against the original `std::map`/`std::list`
+  internals. No real ITCH day file is available in this environment, so the
+  macro (`itch_replay`) run and the book-vs-feed split are marked pending in
+  `BENCH.md` rather than filled with invented numbers.
 
 ## Build & test
 

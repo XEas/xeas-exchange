@@ -9,6 +9,8 @@
 #include "xeas/replay.h"
 #include "xeas/router.h"
 
+#include <sys/resource.h>
+
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -75,6 +77,18 @@ const char* type_name(char type) {
     return nullptr;
 }
 
+// ru_maxrss is bytes on macOS and KiB on Linux — normalized to bytes here.
+// Platform code stays out of the libraries (spec §2): this lives in main only.
+std::uint64_t peak_rss_bytes() {
+    rusage ru{};
+    getrusage(RUSAGE_SELF, &ru);
+#if defined(__APPLE__)
+    return static_cast<std::uint64_t>(ru.ru_maxrss);
+#else
+    return static_cast<std::uint64_t>(ru.ru_maxrss) * 1024;
+#endif
+}
+
 void print_stats(const ReplayStats& stats, const BookRouter& router,
                  std::ostream& out) {
     out << "--- message counts by type ---\n";
@@ -115,6 +129,7 @@ void print_stats(const ReplayStats& stats, const BookRouter& router,
                    stats.elapsed_seconds
             << " MiB/s\n";
     }
+    out << "  peak RSS            " << (peak_rss_bytes() / (1024 * 1024)) << " MiB\n";
 }
 
 void print_book_error(const BookError& e, std::ostream& out) {
