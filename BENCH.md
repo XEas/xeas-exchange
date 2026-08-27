@@ -49,6 +49,12 @@ plus per-impl RSS runs with `--impl new` and `--impl baseline`.
 | 2 (order pool + intrusive lists) | insert | new | 6.27 | 6.10 | 159.4 | 1.17x | 1556 [^comb] |
 | 2 (order pool + intrusive lists) | deep | baseline | 2.66 | 2.09 | 376.1 | 1.00x | 1558 [^comb] |
 | 2 (order pool + intrusive lists) | deep | new | 2.73 | 2.56 | 365.8 | 1.03x | 1558 [^comb] |
+| 3 (banded flat array + bitmaps + overflow) [^pwr3] | steady | baseline | 4.71 | 3.85 | 212.3 | 1.00x | 820 [^rss] |
+| 3 (banded flat array + bitmaps + overflow) | steady | new | 6.71 | 5.73 | 149.0 | 1.42x | 775 [^rss] |
+| 3 (banded flat array + bitmaps + overflow) | insert | baseline | 5.49 | 5.20 | 182.1 | 1.00x | 1225 [^comb] |
+| 3 (banded flat array + bitmaps + overflow) | insert | new | 10.66 | 10.36 | 93.8 | 1.94x | 1354 [^comb] |
+| 3 (banded flat array + bitmaps + overflow) | deep | baseline | 2.75 | 2.10 | 363.8 | 1.00x | 1397 [^comb] |
+| 3 (banded flat array + bitmaps + overflow) | deep | new | 3.48 | 3.19 | 287.6 | 1.26x | 1397 [^comb] |
 
 [^rss]: `steady` peak RSS is from the separate, clean per-impl runs
 (`--impl baseline` / `--impl new`, run in isolation) so the ~48 B/event tape
@@ -72,6 +78,11 @@ batt`: "Now drawing from 'Battery Power'", discharging), vs. 87% for phase
 power state, noted per the Machine section's caveat above. No `min=0.01`
 sleep-artifact outliers were observed in the phase-2 runs (unlike phase 1's
 `new`/steady min, see [^min]).
+[^pwr3]: Phase-3 rows were measured on battery power, 95% draining to 94%
+across the three runs (`pmset -g batt`: "Now drawing from 'Battery Power'",
+discharging) — the same non-AC, non-quiet-machine caveat as phases 1-2, and
+close to phase 2's starting point rather than phase 1's. No `min=0.01`
+sleep-artifact outliers were observed in the phase-3 runs.
 
 ## Macrobenchmark: full-day `itch_replay`
 
@@ -88,7 +99,53 @@ milestone, not license to widen this one.
 
 ## Band constants (phase 3 tuning)
 
-`kInitialBandTicks = 4096`, `kMaxBandTicks = 262144` — provisional, named in
-`src/book.cpp`. Finalized from a real-day per-symbol price-range histogram
-(share of a symbol's quoted range covered by a 262,144-tick window around its
-first quote); recorded here when measured.
+`kInitialBandTicks = 4096`, `kMaxBandTicks = 262144` — **still provisional**.
+No real-day `*.NASDAQ_ITCH50` file is available in this environment, so there
+is no per-symbol price-range histogram to tune against, and these constants
+are left unchanged in `src/book.cpp` for this task. They remain a named,
+documented estimate, not a measured one. When a day file becomes available,
+compute the per-symbol quoted-range histogram (share of a symbol's range
+covered by a 262,144-tick window around its first quote) and revisit both
+constants together with the re-anchor question below.
+
+**Review finding, spec-accepted as documentation-only for this phase:** the
+band anchors on the first add for a side (`band_anchor`, `kInitialBandTicks`
+wide, centered on that first price) and it **never re-anchors relative to
+current trading activity** — the only thing that ever moves `lo` afterward is
+`band_grow_to_cover`, which re-centers the window to cover a specific
+out-of-band price *while growing toward it*, capped at `kMaxBandTicks`. Once
+the window has grown to the full `kMaxBandTicks` (262,144 ticks) width, that
+growth path is exhausted: any further out-of-band price makes
+`band_grow_to_cover` return `false` (span would exceed the cap), the price
+goes to `overflow`, and — critically — nothing thereafter ever recenters
+`lo` again. The window's position is then pinned for the rest of the day,
+regardless of where trading subsequently moves.
+
+The failure mode this creates: a single historical outlier seen early on a
+side — a fat-finger print, an opening-cross artifact, a halt/reopen far from
+the prior close — can force the window to jump straight to `kMaxBandTicks`
+in one growth step (doubling-to-cover-span picks whatever size is needed),
+anchored around that outlier before the symbol's real intraday range is
+known. From then on the window is pinned at that size and position. As the
+day's actual mid subsequently drifts away from that early, spurious anchor,
+prices near the current mid can fall outside the pinned `[lo, lo +
+262,144)` window — up to the full window width, a bit over $26 at the
+project's ×10,000 fixed-point scale (262,144 ticks ÷ 10,000 = $26.2144), if
+the outlier happened to sit near one edge of the eventual window rather than
+its center — sending all new levels near the current mid to the `overflow`
+`std::map` instead of the O(1) band path. Correctness is unaffected either
+way (`overflow` is exact and fully checked by `check_invariants`, including
+by the new `InvariantsV2.InBandPriceInOverflowIsFlagged` test added in this
+phase); only the speed characteristic degrades from array/bitmap O(1) to
+`std::map` O(log n) for the affected side, for the remainder of the day.
+
+The candidate mitigation is **re-anchor-on-drain**: when a side's band goes
+fully empty (no occupied in-band slot; `overflow` may still be non-empty),
+recenter `lo` around the current best price instead of leaving the stale,
+possibly outlier-pinned window in place. This is not implemented here — it
+needs the same real-day histogram data to judge whether drain-driven
+re-anchoring is worth its own cost (a full slots/words rebuild, same
+mechanism as `band_grow_to_cover`'s existing rebuild) versus simply accepting
+the overflow-map fallback as a rare, correctness-preserving degradation. Left
+as a follow-up to evaluate once a day file and histogram are available, not a
+phase-3 code change.

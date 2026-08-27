@@ -66,6 +66,24 @@ struct BookTestPeer {
         });
         return prices;
     }
+
+    // --- phase-3 corruption helpers ---
+    template <class FlatSideT>
+    static void flip_tick_bit_in(FlatSideT& s, Price price) {
+        const auto off = static_cast<std::size_t>(price - s.lo);
+        s.words[off >> 6] ^= (1ULL << (off & 63));
+    }
+    static void flip_tick_bit(Book& b, Side side, Price price) {
+        if (side == Side::Bid) flip_tick_bit_in(b.bids_, price);
+        else flip_tick_bit_in(b.asks_, price);
+    }
+    static void clear_best_cache(Book& b, Side side) {
+        (side == Side::Bid ? b.bids_.best : b.asks_.best) = Book::kNone;
+    }
+    static void inject_overflow_in_band(Book& b, Side side, Price price) {
+        if (side == Side::Bid) b.bids_.overflow.emplace(price, 0u);
+        else b.asks_.overflow.emplace(price, 0u);
+    }
 };
 
 }  // namespace xeas
@@ -593,6 +611,27 @@ TEST(BandGrowth, GrowthWhileCrossedKeepsBothSidesRight) {
     EXPECT_EQ(book.best_bid()->price, 1'010'000);
     EXPECT_EQ(book.size_at(Side::Ask, 1'003'500), 50);
     EXPECT_TRUE(crossed_only(check_invariants(book)));
+}
+
+TEST(InvariantsV2, BitmapSlotDisagreementIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    BookTestPeer::flip_tick_bit(book, Side::Bid, 1'000'000);
+    EXPECT_TRUE(any_contains(check_invariants(book), "bitmap disagrees"));
+}
+
+TEST(InvariantsV2, StaleCachedBestIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'010'000, 100));
+    BookTestPeer::clear_best_cache(book, Side::Ask);
+    EXPECT_TRUE(any_contains(check_invariants(book), "cached best"));
+}
+
+TEST(InvariantsV2, InBandPriceInOverflowIsFlagged) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    BookTestPeer::inject_overflow_in_band(book, Side::Bid, 1'000'000);
+    EXPECT_TRUE(any_contains(check_invariants(book), "overflow contains in-band price"));
 }
 
 }  // namespace

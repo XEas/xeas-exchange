@@ -40,6 +40,11 @@ std::uint32_t scan_all(const std::vector<std::uint64_t>& words,
         for (std::size_t sw = summary.size(); sw-- > 0;) {
             if (summary[sw] == 0) continue;
             const std::size_t word = sw * 64 + top_bit(summary[sw]);
+            // Defensive: a corrupted book (summary says occupied, word says
+            // empty — invariant 6) must not turn into an OOB scan. Report "no
+            // best found" here; check_invariants' explicit bitmap-vs-slots
+            // walk is what actually flags the disagreement.
+            if (word >= words.size() || words[word] == 0) return kNoOffset;
             return static_cast<std::uint32_t>(word * 64 + top_bit(words[word]));
         }
     } else {
@@ -47,6 +52,7 @@ std::uint32_t scan_all(const std::vector<std::uint64_t>& words,
             if (summary[sw] == 0) continue;
             const std::size_t word =
                 sw * 64 + static_cast<std::size_t>(std::countr_zero(summary[sw]));
+            if (word >= words.size() || words[word] == 0) return kNoOffset;
             return static_cast<std::uint32_t>(
                 word * 64 + static_cast<std::size_t>(std::countr_zero(words[word])));
         }
