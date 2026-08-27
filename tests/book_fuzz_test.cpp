@@ -47,6 +47,25 @@ struct BookTestPeer {
     static void corrupt_handle_level(Book& b, OrderId id, Side side, Price price) {
         b.orders_.at(id).level = b.level_index(side, price);
     }
+
+    // --- band accessors (phase 3) ---
+    static Price band_lo(const Book& b, Side side) {
+        return side == Side::Bid ? b.bids_.lo : b.asks_.lo;
+    }
+    static std::size_t band_ticks(const Book& b, Side side) {
+        return side == Side::Bid ? b.bids_.slots.size() : b.asks_.slots.size();
+    }
+    static bool in_overflow(const Book& b, Side side, Price price) {
+        return side == Side::Bid ? b.bids_.overflow.count(price) != 0
+                                 : b.asks_.overflow.count(price) != 0;
+    }
+    static std::vector<Price> ordered_prices(const Book& b, Side side) {
+        std::vector<Price> prices;
+        b.for_each_level(side, [&](std::uint32_t, const Book::Level& level) {
+            prices.push_back(level.price);
+        });
+        return prices;
+    }
 };
 
 }  // namespace xeas
@@ -478,6 +497,102 @@ TEST(InvariantsV2, WrongLevelHandleIsFlagged) {
     apply(book, make_add(2, Side::Ask, 1'020'000, 50));
     BookTestPeer::corrupt_handle_level(book, 1, Side::Ask, 1'020'000);
     EXPECT_TRUE(any_contains(check_invariants(book), "disagrees"));
+}
+
+// ---------------------------------------------------------------------------
+// BandGrowth: anchor, geometric growth, overflow, merged best-first order
+// ---------------------------------------------------------------------------
+
+TEST(BandGrowth, FirstAddAnchorsTheBand) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'000'000, 100));
+    const std::size_t ticks = BookTestPeer::band_ticks(book, Side::Ask);
+    EXPECT_GT(ticks, 0u);
+    EXPECT_EQ(BookTestPeer::band_lo(book, Side::Ask),
+              1'000'000 - static_cast<Price>(ticks / 2));   // centered on the first add
+    EXPECT_FALSE(BookTestPeer::in_overflow(book, Side::Ask, 1'000'000));
+    EXPECT_EQ(book.best_ask()->price, 1'000'000);
+    EXPECT_EQ(BookTestPeer::band_ticks(book, Side::Bid), 0u);   // lazy per side
+    EXPECT_TRUE(check_invariants(book).empty());
+}
+
+TEST(BandGrowth, OutOfBandAddGrowsTheBandAndPreservesQueries) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'000'000, 100));
+    const std::size_t before = BookTestPeer::band_ticks(book, Side::Ask);
+    apply(book, make_add(2, Side::Ask, 1'003'000, 50));   // past the initial hi edge
+    EXPECT_GT(BookTestPeer::band_ticks(book, Side::Ask), before);
+    EXPECT_FALSE(BookTestPeer::in_overflow(book, Side::Ask, 1'003'000));
+    EXPECT_EQ(book.best_ask()->price, 1'000'000);
+    EXPECT_EQ(book.size_at(Side::Ask, 1'000'000), 100);
+    EXPECT_EQ(book.size_at(Side::Ask, 1'003'000), 50);
+    EXPECT_EQ(book.level_count(Side::Ask), 2u);
+    EXPECT_EQ(book.find_order(1)->price, 1'000'000);
+    EXPECT_TRUE(check_invariants(book).empty());
+}
+
+TEST(BandGrowth, FarPriceLandsInOverflowAndCanBeBest) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'000'000, 100));
+    apply(book, make_add(2, Side::Ask, 100, 25));   // ~1M ticks away: overflow
+    EXPECT_TRUE(BookTestPeer::in_overflow(book, Side::Ask, 100));
+    EXPECT_EQ(book.size_at(Side::Ask, 100), 25);
+    EXPECT_EQ(book.best_ask()->price, 100);         // the lone $0.01 ask is the BBO
+    EXPECT_EQ(book.level_count(Side::Ask), 2u);
+    EXPECT_TRUE(check_invariants(book).empty());
+}
+
+TEST(BandGrowth, LoneOverflowOrderIsTheBbo) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'000'000, 100));
+    apply(book, make_add(2, Side::Bid, 5'000'000, 25));   // far above: overflow bid
+    EXPECT_EQ(book.best_bid()->price, 5'000'000);
+    apply(book, make_delete(2));
+    EXPECT_EQ(book.best_bid()->price, 1'000'000);
+    apply(book, make_delete(1));
+    apply(book, make_add(3, Side::Bid, 5'000'000, 10));   // band empty, overflow only
+    EXPECT_EQ(book.best_bid()->price, 5'000'000);
+    EXPECT_EQ(book.best_bid()->total_shares, 10);
+    EXPECT_TRUE(check_invariants(book).empty());
+}
+
+TEST(BandGrowth, BandAndOverflowInterleaveInSortedOrder) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'000'000, 10));   // anchors the band
+    apply(book, make_add(2, Side::Ask, 1'000'100, 10));   // in band
+    apply(book, make_add(3, Side::Ask, 100, 10));         // overflow, below band
+    apply(book, make_add(4, Side::Ask, 5'000'000, 10));   // overflow, above band
+    EXPECT_EQ(BookTestPeer::ordered_prices(book, Side::Ask),
+              (std::vector<Price>{100, 1'000'000, 1'000'100, 5'000'000}));
+    apply(book, make_add(5, Side::Bid, 900'000, 10));
+    apply(book, make_add(6, Side::Bid, 400'000, 10));     // out-of-band low bid: grows or overflows
+    const auto bid_prices = BookTestPeer::ordered_prices(book, Side::Bid);
+    EXPECT_EQ(bid_prices, (std::vector<Price>{900'000, 400'000}));   // descending
+    EXPECT_TRUE(crossed_only(check_invariants(book)));  // Note: brief says .empty() but book is crossed
+}
+
+TEST(BandGrowth, NextBestScanCrossesWordAndSummaryBoundaries) {
+    Book book;
+    apply(book, make_add(1, Side::Ask, 1'000'000, 10));
+    apply(book, make_add(2, Side::Ask, 1'000'100, 10));   // different bitmap word
+    apply(book, make_delete(1));
+    EXPECT_EQ(book.best_ask()->price, 1'000'100);          // scan crossed a word
+    apply(book, make_add(3, Side::Ask, 1'200'000, 10));    // grows the band wide
+    apply(book, make_delete(2));
+    EXPECT_EQ(book.best_ask()->price, 1'200'000);          // scan crossed summary words
+    EXPECT_TRUE(check_invariants(book).empty());
+}
+
+TEST(BandGrowth, GrowthWhileCrossedKeepsBothSidesRight) {
+    Book book;
+    apply(book, make_add(1, Side::Bid, 1'010'000, 100));
+    apply(book, make_add(2, Side::Ask, 1'000'000, 100));   // crossed, stored as given
+    apply(book, make_add(3, Side::Ask, 1'003'500, 50));    // out-of-band: grow while crossed
+    EXPECT_TRUE(is_crossed(book));
+    EXPECT_EQ(book.best_ask()->price, 1'000'000);
+    EXPECT_EQ(book.best_bid()->price, 1'010'000);
+    EXPECT_EQ(book.size_at(Side::Ask, 1'003'500), 50);
+    EXPECT_TRUE(crossed_only(check_invariants(book)));
 }
 
 }  // namespace

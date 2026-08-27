@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace xeas {
@@ -103,9 +104,37 @@ private:
         std::uint32_t level;
     };
 
-    using BidMap = std::map<Price, std::uint32_t, std::greater<>>;  // price -> level index
-    using AskMap = std::map<Price, std::uint32_t, std::less<>>;
+    template <class Compare>           // std::greater<> bids, std::less<> asks
+    struct FlatSide {
+        Price lo = 0;                             // band = [lo, lo + slots.size())
+        std::vector<std::uint32_t> slots;         // level index + 1; 0 = empty
+        std::vector<std::uint64_t> words;         // occupancy, 64 ticks per word
+        std::vector<std::uint64_t> summary;       // one bit per word
+        std::uint32_t best = kNone;               // slot OFFSET of the best in-band level
+        std::map<Price, std::uint32_t, Compare> overflow;  // far prices, exact
+        std::size_t level_count = 0;              // band + overflow
+    };
+    using BidSide = FlatSide<std::greater<>>;
+    using AskSide = FlatSide<std::less<>>;
     using OrderIndexMap = std::unordered_map<OrderId, OrderHandle>;
+
+    // Band/overflow operations. Declared here, defined and only instantiated
+    // in book.cpp.
+    template <class Compare>
+    static void band_anchor(FlatSide<Compare>& s, Price price);
+    template <class Compare>
+    static bool band_grow_to_cover(FlatSide<Compare>& s, Price price);
+    template <class Compare>
+    static std::uint32_t side_find(const FlatSide<Compare>& s, Price price);
+    template <class Compare>
+    static void side_insert(FlatSide<Compare>& s, Price price, std::uint32_t level_idx);
+    template <class Compare>
+    static void side_erase(FlatSide<Compare>& s, Price price);
+    template <class Compare>
+    static std::optional<std::pair<Price, std::uint32_t>> side_best(const FlatSide<Compare>& s);
+    template <class Compare>
+    void side_for_each(const FlatSide<Compare>& s,
+                       const std::function<void(std::uint32_t, const Level&)>& fn) const;
 
     // kNone if the side has no level at this price.
     std::uint32_t level_index(Side side, Price price) const;
@@ -122,8 +151,8 @@ private:
 
     OrderPool order_pool_;
     LevelPool level_pool_;
-    BidMap bids_;
-    AskMap asks_;
+    BidSide bids_;
+    AskSide asks_;
     OrderIndexMap orders_;
 
     friend void apply(Book& book, const Event& event);
