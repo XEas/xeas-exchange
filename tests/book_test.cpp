@@ -76,47 +76,34 @@ namespace xeas {
 struct BookTestPeer {
     static std::vector<OrderId> level_order_ids(const Book& b, Side side, Price price) {
         std::vector<OrderId> ids;
-        const Book::Level* level = nullptr;
-        if (side == Side::Bid) {
-            const auto it = b.bids_.find(price);
-            if (it != b.bids_.end()) level = &it->second;
-        } else {
-            const auto it = b.asks_.find(price);
-            if (it != b.asks_.end()) level = &it->second;
-        }
-        if (level != nullptr) {
-            for (const auto& order : level->orders) ids.push_back(order.id);
+        const std::uint32_t idx = b.level_index(side, price);
+        if (idx == Book::kNone) return ids;
+        for (std::uint32_t cur = b.level_pool_[idx].head; cur != Book::kNone;
+             cur = b.order_pool_[cur].next) {
+            ids.push_back(b.order_pool_[cur].id);
         }
         return ids;
     }
 
     // --- corruption helpers (invariant-checker tests only) ---
     static void corrupt_total_shares(Book& b, Side side, Price price, std::int64_t v) {
-        if (side == Side::Bid) {
-            b.bids_.at(price).total_shares = v;
-        } else {
-            b.asks_.at(price).total_shares = v;
-        }
+        b.level_pool_[b.level_index(side, price)].total_shares = v;
     }
 
     static void add_empty_level(Book& b, Side side, Price price) {
-        if (side == Side::Bid) {
-            b.bids_[price];
-        } else {
-            b.asks_[price];
-        }
+        b.create_level(side, price);
     }
 
     static void zero_order_qty(Book& b, OrderId id) {
-        b.orders_.at(id).it->remaining = 0;
+        b.order_pool_[b.orders_.at(id).node].remaining = 0;
     }
 
     static void drop_from_index(Book& b, OrderId id) {
         b.orders_.erase(id);
     }
 
-    static void corrupt_handle_price(Book& b, OrderId id, Price wrong_price) {
-        b.orders_.at(id).price = wrong_price;
+    static void corrupt_handle_level(Book& b, OrderId id, Side side, Price price) {
+        b.orders_.at(id).level = b.level_index(side, price);
     }
 };
 
@@ -290,7 +277,8 @@ TEST(Invariants, IndexLevelDisagreementIsFlagged) {
 TEST(Invariants, IndexHandleDisagreementIsFlagged) {
     Book book;
     apply(book, make_add(1, Side::Bid, 1'000'000, 100));
-    BookTestPeer::corrupt_handle_price(book, 1, 999'000);
+    apply(book, make_add(2, Side::Bid, 990'000, 50));
+    BookTestPeer::corrupt_handle_level(book, 1, Side::Bid, 990'000);
     EXPECT_TRUE(any_contains(check_invariants(book), "disagrees"));
 }
 

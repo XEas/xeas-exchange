@@ -1,8 +1,55 @@
 #include "xeas/book.h"
 
-#include <iterator>
-
 namespace xeas {
+
+// --- pools -------------------------------------------------------------------
+
+std::uint32_t Book::OrderPool::allocate(OrderId id, Qty qty) {
+    std::uint32_t idx;
+    if (free_head_ != kNone) {
+        idx = free_head_;
+        free_head_ = nodes_[idx].next;   // freelist is threaded through next
+    } else {
+        idx = static_cast<std::uint32_t>(nodes_.size());
+        nodes_.emplace_back();
+    }
+    OrderNode& node = nodes_[idx];
+    node.id = id;
+    node.remaining = qty;
+    node.prev = kNone;
+    node.next = kNone;
+    return idx;
+}
+
+void Book::OrderPool::release(std::uint32_t idx) {
+    nodes_[idx].next = free_head_;
+    nodes_[idx].prev = kNone;
+    free_head_ = idx;
+}
+
+std::uint32_t Book::LevelPool::allocate(Price price, Side side) {
+    std::uint32_t idx;
+    if (free_head_ != kNone) {
+        idx = free_head_;
+        free_head_ = levels_[idx].head;  // freelist is threaded through head
+    } else {
+        idx = static_cast<std::uint32_t>(levels_.size());
+        levels_.emplace_back();
+    }
+    Level& level = levels_[idx];
+    level.head = kNone;
+    level.tail = kNone;
+    level.total_shares = 0;
+    level.price = price;
+    level.side = side;
+    return idx;
+}
+
+void Book::LevelPool::release(std::uint32_t idx) {
+    levels_[idx].head = free_head_;
+    levels_[idx].tail = kNone;
+    free_head_ = idx;
+}
 
 // --- queries -----------------------------------------------------------------
 
@@ -10,25 +57,30 @@ std::optional<BBO> Book::best_bid() const {
     if (bids_.empty()) {
         return std::nullopt;
     }
-    const auto& [price, level] = *bids_.begin();
-    return BBO{price, level.total_shares};
+    const auto& [price, idx] = *bids_.begin();
+    return BBO{price, level_pool_[idx].total_shares};
 }
 
 std::optional<BBO> Book::best_ask() const {
     if (asks_.empty()) {
         return std::nullopt;
     }
-    const auto& [price, level] = *asks_.begin();
-    return BBO{price, level.total_shares};
+    const auto& [price, idx] = *asks_.begin();
+    return BBO{price, level_pool_[idx].total_shares};
+}
+
+std::uint32_t Book::level_index(Side side, Price price) const {
+    if (side == Side::Bid) {
+        const auto it = bids_.find(price);
+        return it == bids_.end() ? kNone : it->second;
+    }
+    const auto it = asks_.find(price);
+    return it == asks_.end() ? kNone : it->second;
 }
 
 std::int64_t Book::size_at(Side side, Price price) const {
-    if (side == Side::Bid) {
-        const auto it = bids_.find(price);
-        return it == bids_.end() ? 0 : it->second.total_shares;
-    }
-    const auto it = asks_.find(price);
-    return it == asks_.end() ? 0 : it->second.total_shares;
+    const std::uint32_t idx = level_index(side, price);
+    return idx == kNone ? 0 : level_pool_[idx].total_shares;
 }
 
 std::optional<OrderInfo> Book::find_order(OrderId order_id) const {
@@ -36,8 +88,9 @@ std::optional<OrderInfo> Book::find_order(OrderId order_id) const {
     if (it == orders_.end()) {
         return std::nullopt;
     }
-    const OrderHandle& h = it->second;
-    return OrderInfo{h.side, h.price, h.it->remaining};
+    const OrderNode& node = order_pool_[it->second.node];
+    const Level& level = level_pool_[it->second.level];
+    return OrderInfo{level.side, level.price, node.remaining};
 }
 
 std::size_t Book::order_count() const {
@@ -50,25 +103,58 @@ std::size_t Book::level_count(Side side) const {
 
 // --- mutation helpers ----------------------------------------------------------
 
-void Book::insert_order(Side side, Price price, OrderId order_id, Qty quantity) {
-    Level& level = (side == Side::Bid) ? bids_[price] : asks_[price];
-    level.orders.push_back(Order{order_id, quantity});
-    const auto pos = std::prev(level.orders.end());
-    level.total_shares += static_cast<std::int64_t>(quantity);
-    orders_.emplace(order_id, OrderHandle{side, price, &level, pos});
+std::uint32_t Book::create_level(Side side, Price price) {
+    const std::uint32_t idx = level_pool_.allocate(price, side);
+    if (side == Side::Bid) {
+        bids_.emplace(price, idx);
+    } else {
+        asks_.emplace(price, idx);
+    }
+    return idx;
 }
 
-void Book::erase_order(OrderIndex::iterator index_it) {
-    OrderHandle& h = index_it->second;
-    h.level->total_shares -= static_cast<std::int64_t>(h.it->remaining);
-    h.level->orders.erase(h.it);
-    if (h.level->orders.empty()) {
+void Book::insert_order(Side side, Price price, OrderId order_id, Qty quantity) {
+    std::uint32_t level_idx = level_index(side, price);
+    if (level_idx == kNone) {
+        level_idx = create_level(side, price);
+    }
+    const std::uint32_t node_idx = order_pool_.allocate(order_id, quantity);
+    Level& level = level_pool_[level_idx];   // refs taken AFTER all allocations
+    order_pool_[node_idx].prev = level.tail;
+    if (level.tail != kNone) {
+        order_pool_[level.tail].next = node_idx;
+    } else {
+        level.head = node_idx;
+    }
+    level.tail = node_idx;
+    level.total_shares += static_cast<std::int64_t>(quantity);
+    orders_.emplace(order_id, OrderHandle{node_idx, level_idx});
+}
+
+void Book::erase_order(OrderIndexMap::iterator index_it) {
+    const OrderHandle h = index_it->second;
+    const OrderNode node = order_pool_[h.node];  // copy: the slot is released below
+    Level& level = level_pool_[h.level];
+    level.total_shares -= static_cast<std::int64_t>(node.remaining);
+    if (node.prev != kNone) {
+        order_pool_[node.prev].next = node.next;
+    } else {
+        level.head = node.next;
+    }
+    if (node.next != kNone) {
+        order_pool_[node.next].prev = node.prev;
+    } else {
+        level.tail = node.prev;
+    }
+    order_pool_.release(h.node);
+    if (level.head == kNone) {
         // No empty levels ever: drop the level immediately (O(log levels)).
-        if (h.side == Side::Bid) {
-            bids_.erase(h.price);
+        if (level.side == Side::Bid) {
+            bids_.erase(level.price);
         } else {
-            asks_.erase(h.price);
+            asks_.erase(level.price);
         }
+        level_pool_.release(h.level);
     }
     orders_.erase(index_it);
 }
@@ -105,15 +191,16 @@ void apply(Book& book, const Event& event) {
         if (event.quantity == 0) {
             throw BookError(event, std::string(name) + ": zero quantity");
         }
-        auto& h = index_it->second;
-        if (event.quantity > h.it->remaining) {
+        Book::OrderNode& node = book.order_pool_[index_it->second.node];
+        if (event.quantity > node.remaining) {
             throw BookError(event, std::string(name) + ": quantity exceeds remaining shares");
         }
-        if (event.quantity == h.it->remaining) {
+        if (event.quantity == node.remaining) {
             book.erase_order(index_it);  // reaches zero: removed immediately
         } else {
-            h.it->remaining -= event.quantity;
-            h.level->total_shares -= static_cast<std::int64_t>(event.quantity);
+            node.remaining -= event.quantity;
+            book.level_pool_[index_it->second.level].total_shares -=
+                static_cast<std::int64_t>(event.quantity);
         }
         break;
     }
@@ -149,7 +236,7 @@ void apply(Book& book, const Event& event) {
         // level's queue — time priority is lost (ITCH semantics).
         // All validation passed above; neither call below can fail validation
         // (allocation failure aside — post-throw state is unspecified, spec section 4).
-        const Side side = index_it->second.side;
+        const Side side = book.level_pool_[index_it->second.level].side;
         book.erase_order(index_it);
         book.insert_order(side, event.price, event.new_order_id, event.quantity);
         break;
@@ -161,34 +248,62 @@ void apply(Book& book, const Event& event) {
     }
 }
 
+// --- for_each_level --------------------------------------------------------------
+// Strict best-first merged walk. Out of band only (checker + test peer).
+
+void Book::for_each_level(
+    Side side, const std::function<void(std::uint32_t, const Level&)>& fn) const {
+    if (side == Side::Bid) {
+        for (const auto& entry : bids_) fn(entry.second, level_pool_[entry.second]);
+    } else {
+        for (const auto& entry : asks_) fn(entry.second, level_pool_[entry.second]);
+    }
+}
+
 // --- check_invariants ------------------------------------------------------------
-// Out of band: walks the whole book; never called from apply().
+// Out of band: walks the whole book; never called from apply(). Invariants 1-5
+// from the Milestone 1 spec §6 verbatim, iterated via for_each_level so level
+// sortedness is verified against the real walk order, plus invariant 8
+// (intrusive links + freelists) from the Milestone 3 spec §4.
 
 std::vector<std::string> check_invariants(const Book& book) {
     std::vector<std::string> violations;
 
     // Invariant 1: best bid < best ask when both sides are non-empty.
-    if (!book.bids_.empty() && !book.asks_.empty()) {
-        const Price best_bid = book.bids_.begin()->first;
-        const Price best_ask = book.asks_.begin()->first;
-        if (best_bid >= best_ask) {
-            violations.push_back("book crossed or locked: best bid " + std::to_string(best_bid) +
-                                 " >= best ask " + std::to_string(best_ask));
-        }
+    const auto best_bid = book.best_bid();
+    const auto best_ask = book.best_ask();
+    if (best_bid.has_value() && best_ask.has_value() && best_bid->price >= best_ask->price) {
+        violations.push_back("book crossed or locked: best bid " +
+                             std::to_string(best_bid->price) + " >= best ask " +
+                             std::to_string(best_ask->price));
     }
 
     std::size_t orders_in_levels = 0;
+    // Liveness maps for invariant 8: what the level walk reaches...
+    std::vector<char> node_in_level(book.order_pool_.capacity(), 0);
+    std::vector<char> level_in_side(book.level_pool_.capacity(), 0);
 
-    const auto check_side = [&](const auto& levels, Side side, const char* name) {
+    const auto check_side = [&](Side side, const char* name) {
         std::optional<Price> prev_price;
-        for (const auto& [price, level] : levels) {
+        std::size_t levels_seen = 0;
+        book.for_each_level(side, [&](std::uint32_t level_idx, const Book::Level& level) {
+            ++levels_seen;
+            const Price price = level.price;
+            if (level_in_side[level_idx] != 0) {
+                violations.push_back(std::string(name) + " level " + std::to_string(price) +
+                                     " appears twice in the price structure");
+            }
+            level_in_side[level_idx] = 1;
+            if (level.side != side) {
+                violations.push_back(std::string(name) + " level " + std::to_string(price) +
+                                     " stored on the wrong side");
+            }
             // Invariant 3 (levels): no empty levels.
-            if (level.orders.empty()) {
+            if (level.head == Book::kNone) {
                 violations.push_back(std::string(name) + " level " + std::to_string(price) +
                                      " is empty");
             }
             // Invariant 4: strictly sorted best-first (descending bids, ascending asks).
-            // Guaranteed by std::map today; kept so Milestone 3 internals stay honest.
             if (prev_price.has_value()) {
                 const bool ordered =
                     (side == Side::Bid) ? (*prev_price > price) : (*prev_price < price);
@@ -200,33 +315,60 @@ std::vector<std::string> check_invariants(const Book& book) {
             }
             prev_price = price;
 
+            // Invariant 8: the intrusive chain is well-formed (reciprocal links,
+            // consistent head/tail, no cycles, no node in two levels).
             std::int64_t sum = 0;
-            for (const auto& order : level.orders) {
+            std::uint32_t prev = Book::kNone;
+            std::uint32_t cur = level.head;
+            std::size_t chain_len = 0;
+            while (cur != Book::kNone) {
+                if (cur >= book.order_pool_.capacity()) {
+                    violations.push_back(std::string(name) + " level " + std::to_string(price) +
+                                         " chain index out of range");
+                    break;
+                }
+                if (++chain_len > book.order_pool_.capacity()) {
+                    violations.push_back(std::string(name) + " level " + std::to_string(price) +
+                                         " intrusive chain does not terminate (cycle)");
+                    break;
+                }
+                const Book::OrderNode& node = book.order_pool_[cur];
+                if (node.prev != prev) {
+                    violations.push_back("order " + std::to_string(node.id) +
+                                         " prev/next links not reciprocal at " + name +
+                                         " level " + std::to_string(price));
+                }
+                if (node_in_level[cur] != 0) {
+                    violations.push_back("order node " + std::to_string(cur) +
+                                         " linked into more than one level");
+                }
+                node_in_level[cur] = 1;
                 // Invariant 3 (orders): no zero-quantity orders.
-                if (order.remaining == 0) {
-                    violations.push_back("zero-quantity order " + std::to_string(order.id) +
+                if (node.remaining == 0) {
+                    violations.push_back("zero-quantity order " + std::to_string(node.id) +
                                          " at " + std::string(name) + " level " +
                                          std::to_string(price));
                 }
-                sum += static_cast<std::int64_t>(order.remaining);
-
+                sum += static_cast<std::int64_t>(node.remaining);
                 // Invariant 5 (level -> index): every order in a level is indexed,
-                // and its handle points at exactly this node on this side/price.
-                const auto idx = book.orders_.find(order.id);
+                // and its handle points at exactly this node in this level.
+                const auto idx = book.orders_.find(node.id);
                 if (idx == book.orders_.end()) {
-                    violations.push_back("order " + std::to_string(order.id) + " in " + name +
+                    violations.push_back("order " + std::to_string(node.id) + " in " + name +
                                          " level " + std::to_string(price) +
                                          " missing from index");
-                } else {
-                    const auto& h = idx->second;
-                    if (h.side != side || h.price != price || &*h.it != &order) {
-                        violations.push_back("index entry for order " + std::to_string(order.id) +
-                                             " disagrees with its level");
-                    }
+                } else if (idx->second.node != cur || idx->second.level != level_idx) {
+                    violations.push_back("index entry for order " + std::to_string(node.id) +
+                                         " disagrees with its level");
                 }
                 ++orders_in_levels;
+                prev = cur;
+                cur = node.next;
             }
-
+            if (level.tail != prev) {
+                violations.push_back(std::string(name) + " level " + std::to_string(price) +
+                                     " tail does not match the last chain node");
+            }
             // Invariant 2: cached aggregate equals the sum of remaining shares.
             if (sum != level.total_shares) {
                 violations.push_back(std::string(name) + " level " + std::to_string(price) +
@@ -234,11 +376,16 @@ std::vector<std::string> check_invariants(const Book& book) {
                                      std::to_string(level.total_shares) +
                                      " != sum of orders " + std::to_string(sum));
             }
+        });
+        if (levels_seen != book.level_count(side)) {
+            violations.push_back(std::string(name) + " level count " +
+                                 std::to_string(book.level_count(side)) +
+                                 " != levels walked " + std::to_string(levels_seen));
         }
     };
 
-    check_side(book.bids_, Side::Bid, "bid");
-    check_side(book.asks_, Side::Ask, "ask");
+    check_side(Side::Bid, "bid");
+    check_side(Side::Ask, "ask");
 
     // Invariant 5 (index -> levels): same count both ways. Combined with the
     // per-order handle check above this makes the agreement exact.
@@ -247,6 +394,44 @@ std::vector<std::string> check_invariants(const Book& book) {
                              " != orders present in levels " +
                              std::to_string(orders_in_levels));
     }
+
+    // Invariant 8 (freelists): free and in-use sets partition each pool —
+    // nothing on a freelist is reachable from a level, nothing leaks.
+    const auto check_freelist = [&](const char* pool_name, std::size_t capacity,
+                                    std::uint32_t free_head, const std::vector<char>& in_use,
+                                    const auto& next_of) {
+        std::vector<char> seen(capacity, 0);
+        std::size_t free_count = 0;
+        std::uint32_t cur = free_head;
+        while (cur != Book::kNone) {
+            if (cur >= capacity || seen[cur] != 0) {
+                violations.push_back(std::string(pool_name) +
+                                     " freelist is malformed (cycle or bad index)");
+                break;
+            }
+            seen[cur] = 1;
+            ++free_count;
+            if (in_use[cur] != 0) {
+                violations.push_back(std::string(pool_name) + " entry " + std::to_string(cur) +
+                                     " is both on the freelist and in a level");
+            }
+            cur = next_of(cur);
+        }
+        std::size_t used = 0;
+        for (const char c : in_use) used += static_cast<std::size_t>(c);
+        // (overlap is reported above; only report a true leak, avoiding underflow)
+        if (used + free_count < capacity) {
+            violations.push_back(std::string(pool_name) + " leak: " +
+                                 std::to_string(capacity - used - free_count) +
+                                 " entries neither free nor in use");
+        }
+    };
+    check_freelist("order pool", book.order_pool_.capacity(), book.order_pool_.free_head(),
+                   node_in_level,
+                   [&](std::uint32_t i) { return book.order_pool_[i].next; });
+    check_freelist("level pool", book.level_pool_.capacity(), book.level_pool_.free_head(),
+                   level_in_side,
+                   [&](std::uint32_t i) { return book.level_pool_[i].head; });
 
     return violations;
 }

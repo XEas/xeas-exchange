@@ -5,7 +5,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <list>
 #include <map>
 #include <optional>
 #include <stdexcept>
@@ -55,35 +54,77 @@ public:
     std::size_t level_count(Side side) const;
 
 private:
-    struct Order {
+    static constexpr std::uint32_t kNone = 0xFFFF'FFFF;
+
+    struct OrderNode {                 // pool slab entry, addressed by u32 index
         OrderId id;
         Qty remaining;
+        std::uint32_t prev, next;      // intrusive FIFO links; kNone at the ends
+    };                                 // 24 bytes
+
+    struct Level {                     // level pool entry
+        std::uint32_t head = kNone;    // front = oldest (highest time priority)
+        std::uint32_t tail = kNone;
+        std::int64_t total_shares = 0; // cached aggregate, maintained incrementally
+        Price price;                   // a level knows where it lives, so the
+        Side side;                     // handle no longer carries side/price
     };
 
-    struct Level {
-        std::list<Order> orders;       // FIFO: front = oldest (highest time priority)
-        std::int64_t total_shares{0};  // cached aggregate, maintained incrementally
+    class OrderPool {                  // freelist over a growing vector slab;
+    public:                            // u32 indices survive vector growth
+        std::uint32_t allocate(OrderId id, Qty qty);
+        void release(std::uint32_t idx);
+        OrderNode& operator[](std::uint32_t idx) { return nodes_[idx]; }
+        const OrderNode& operator[](std::uint32_t idx) const { return nodes_[idx]; }
+        std::size_t capacity() const { return nodes_.size(); }
+        std::uint32_t free_head() const { return free_head_; }
+    private:
+        std::vector<OrderNode> nodes_;
+        std::uint32_t free_head_ = kNone;   // freelist threaded through next
+        friend struct BookTestPeer;
     };
 
-    struct OrderHandle {
-        Side side;
-        Price price;                    // key for the O(log levels) map erase when the level empties
-        Level* level;                   // stable: std::map nodes never move
-        std::list<Order>::iterator it;  // stable: std::list iterators never invalidate
+    class LevelPool {                  // identical pattern over Level
+    public:
+        std::uint32_t allocate(Price price, Side side);
+        void release(std::uint32_t idx);
+        Level& operator[](std::uint32_t idx) { return levels_[idx]; }
+        const Level& operator[](std::uint32_t idx) const { return levels_[idx]; }
+        std::size_t capacity() const { return levels_.size(); }
+        std::uint32_t free_head() const { return free_head_; }
+    private:
+        std::vector<Level> levels_;
+        std::uint32_t free_head_ = kNone;   // freelist threaded through head
+        friend struct BookTestPeer;
     };
 
-    using BidMap = std::map<Price, Level, std::greater<>>;  // begin() = highest bid
-    using AskMap = std::map<Price, Level, std::less<>>;     // begin() = lowest ask
-    using OrderIndex = std::unordered_map<OrderId, OrderHandle>;
+    struct OrderHandle {               // 8 bytes (was Side+Price+ptr+iterator)
+        std::uint32_t node;
+        std::uint32_t level;
+    };
 
+    using BidMap = std::map<Price, std::uint32_t, std::greater<>>;  // price -> level index
+    using AskMap = std::map<Price, std::uint32_t, std::less<>>;
+    using OrderIndexMap = std::unordered_map<OrderId, OrderHandle>;
+
+    // kNone if the side has no level at this price.
+    std::uint32_t level_index(Side side, Price price) const;
+    // Allocate a level and install it in the side's price structure.
+    std::uint32_t create_level(Side side, Price price);
     // Create the level if needed, enqueue at the back (time priority), index the order.
     void insert_order(Side side, Price price, OrderId order_id, Qty quantity);
     // Unlink the order from its level, drop the level if it emptied, erase from the index.
-    void erase_order(OrderIndex::iterator index_it);
+    void erase_order(OrderIndexMap::iterator index_it);
+    // The single ordered walker (strict best-first). Out-of-band only: used by
+    // check_invariants and BookTestPeer, never on the hot path.
+    void for_each_level(Side side,
+                        const std::function<void(std::uint32_t, const Level&)>& fn) const;
 
+    OrderPool order_pool_;
+    LevelPool level_pool_;
     BidMap bids_;
     AskMap asks_;
-    OrderIndex orders_;
+    OrderIndexMap orders_;
 
     friend void apply(Book& book, const Event& event);
     friend std::vector<std::string> check_invariants(const Book& book);
