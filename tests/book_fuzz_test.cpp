@@ -465,7 +465,7 @@ TEST(InvariantsV2, BrokenPrevNextReciprocityIsFlagged) {
     EXPECT_TRUE(any_contains(check_invariants(book), "reciprocal"));
 }
 
-TEST(InvariantsV2, NodeOnFreelistAndInLevelIsFlagged) {
+TEST(InvariantsV2, LevelOnFreelistWhileLiveIsFlagged) {
     Book book;
     apply(book, make_add(1, Side::Bid, 1'000'000, 100));
     BookTestPeer::set_level_free_head(book, Side::Bid, 1'000'000);
