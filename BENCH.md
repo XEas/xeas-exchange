@@ -26,8 +26,7 @@ and the commands below.
   reported "Now drawing from 'Battery Power'", 87%, discharging) rather than
   AC — not the quiet-machine ideal. Run-to-run median variance was visibly
   higher than expected as a result (e.g. `steady`/baseline median moved
-  between 3.31 and 4.80 Mmsg/s across repeated invocations of the same
-  command); see footnote below the micro table.
+  between 3.31 and 4.80 Mmsg/s across invocations of differing command forms (the combined `--workload all` run vs the standalone per-impl run)); see footnote below the micro table.
 
 ## Microbenchmark: `book_bench`
 
@@ -69,15 +68,14 @@ footprint isn't shared with the other impl's process.
 run (both impls share one process's peak, one workload at a time within that
 process) and is therefore an **upper bound**, not a clean per-impl figure;
 the `steady` row is the one clean comparison.
-[^min]: The `new` impl showed a `min=0.01 Mmsg/s` outlier repeatably across
-independent invocations (with and without `caffeinate -i`, standalone and
-combined runs) while `baseline` never did on the same commands. This
-persisted under `caffeinate`, so it is not machine-sleep noise; it looks like
-a real one-repeat-in-five stall specific to the `new` code path (consistent
-with `new`'s higher peak RSS — plausibly a first-touch page-fault /
-allocator-growth cost). Since phase-1 impls share the same internals per the
-milestone plan, this is flagged as a measurement finding to revisit once the
-impls diverge, not something papered over here.
+[^min]: The phase-1 `new` rows showed a `min=0.01 Mmsg/s` outlier (one repeat
+~1000x slower than the median) across several invocations. Two hypotheses:
+machine sleep inflating `steady_clock` mid-repeat (the measurement session had
+repeated sleeps, and phase-1 `new` shares byte-identical internals with
+`baseline`, making a code-path-specific stall incoherent), or a genuine
+one-repeat stall. The outlier never recurred in phases 2-4 (see [^pwr2..4]),
+which is consistent with the sleep explanation. Medians are robust to it
+either way.
 [^pwr2]: Phase-2 rows were measured on battery power at 100% (`pmset -g
 batt`: "Now drawing from 'Battery Power'", discharging), vs. 87% for phase
 1's measurements — a different point on the same (non-AC, non-quiet-machine)

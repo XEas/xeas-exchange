@@ -94,7 +94,10 @@ ImplResult run_impl(const WorkloadTape& tape, std::uint64_t repeats) {
 void report(std::string_view workload, std::string_view impl, const WorkloadTape& tape,
             std::uint64_t seed, std::uint64_t repeats, const ImplResult& r) {
     std::cout << "workload=" << workload << " impl=" << impl
-              << " events=" << tape.timed.size() << " warm=" << tape.warm.size()
+              << " events=" << tape.timed.size()
+              << " elapsed_s=" << std::fixed << std::setprecision(2)
+              << static_cast<double>(tape.timed.size()) / (r.median_mmsgs * 1e6)
+              << " warm=" << tape.warm.size()
               << " seed=" << seed << " repeats=" << repeats << std::fixed
               << std::setprecision(2) << " median=" << r.median_mmsgs
               << " Mmsg/s min=" << r.min_mmsgs << " Mmsg/s ns_per_event="

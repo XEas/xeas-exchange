@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <type_traits>
 
 namespace {
 
@@ -479,6 +480,7 @@ void Book::erase_order(OrderId order_id, OrderHandle h) {
         level.tail = node.prev;
     }
     order_pool_.release(h.node);
+    // No empty levels ever: drop the level immediately.
     if (level.head == kNone) {
         if (level.side == Side::Bid) {
             side_erase(bids_, level.price);
@@ -550,7 +552,7 @@ void apply(Book& book, const Event& event) {
         if (handle == nullptr) {
             throw BookError(event, "Replace: unknown order_id");
         }
-        // order_id is live, so the count() check alone also catches
+        // order_id is live, so the find() check alone also catches
         // new_order_id == order_id; the explicit test documents the spec.
         if (event.new_order_id == event.order_id ||
             book.orders_.find(event.new_order_id) != nullptr) {
