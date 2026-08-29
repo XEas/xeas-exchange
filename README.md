@@ -76,9 +76,12 @@ before/after numbers.
   (`book_bench --workload steady`, phase 4, `new` vs. `baseline`); a
   `BaselineBook` oracle (`xeas_baseline`) and a differential fuzz harness keep
   every rewrite honest against the original `std::map`/`std::list`
-  internals. No real ITCH day file is available in this environment, so the
-  macro (`itch_replay`) run and the book-vs-feed split are marked pending in
-  `BENCH.md` rather than filled with invented numbers.
+  internals. The full-day macro run (NASDAQ's public Dec 30, 2019 sample
+  day, 268.7M messages) measures **1.62x end-to-end** (7.08 vs. 4.36 Mmsg/s,
+  invariant sweeps off) and shows the feed side, not the book, dominating
+  wall time — plus an ~18x peak-RSS regression from per-book fixed-capacity
+  structures multiplied across 8,892 books. Numbers, the sweep-cost
+  decomposition, and both findings are in `BENCH.md`.
 
 ## Build & test
 
