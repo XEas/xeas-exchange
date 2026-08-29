@@ -100,31 +100,75 @@ discharging) — the same non-AC, non-quiet-machine caveat as phases 1-3. No
 
 Command: `./build-release/itch_replay <day.NASDAQ_ITCH50> --quiet`
 
-| phase | file | msgs/s | MiB/s | peak RSS MiB | live orders peak |
+Day file: `12302019.NASDAQ_ITCH50` — NASDAQ's public sample day (Dec 30,
+2019) from `emi.nasdaq.com/ITCH/Nasdaq ITCH/`, 7.69 GiB uncompressed
+(gzip-CRC verified; the server's `.md5sum` link for this file 404s),
+268,744,780 messages, 263,241,937 events applied, 8,892 books created. Never
+checked in, per the Rules. Both rows were measured **retroactively on
+2026-08-28, after the Milestone 3 merge**, on this same file and machine:
+phase 1 is commit `1d9b7b0` (baseline internals) rebuilt in Release in a
+worktree; phase 4 is merged `main` (`e2603c3`). Median of 5, min recorded.
+Battery power throughout, 93% draining to 88% (see [^sleep]).
+
+| phase | file | msgs/s median (min) | MiB/s | peak RSS MiB | live orders peak |
 |---|---|---|---|---|---|
-| 1 | _pending: requires local day file_ | | | | |
+| 1 (baseline internals) | 12302019 | 3,696,533 (139,887 [^sleep]) | 108.2 | 272 | 1,924,078 |
+| 4 (merged main) | 12302019 | 3,185,598 (2,920,105) | 93.3 | 4,994 [^rssmac] | 1,924,078 |
 
-**Book-vs-feed split (spec §2):** compare `book_bench steady` Mmsg/s with
-end-to-end `itch_replay` msgs/s. Close ⇒ the book dominates and feed-side
-optimization stays out of scope; feed-dominant ⇒ a finding for a future
-milestone, not license to widen this one.
+[^sleep]: This machine idle-sleeps after 1 minute on battery (`pmset -g`:
+`sleep 1`), and Apple Silicon's `steady_clock` keeps counting through sleep.
+Two of the five phase-1 repeats spanned sleeps (174.7 s and 1921.2 s elapsed
+vs. the ~72 s cluster of the other three), so the recorded phase-1 min is a
+sleep artifact, same mechanism as the micro table's [^min]. Medians are
+robust to it; the diagnostic no-sweep runs below were re-run with the machine
+actively held awake after two sleep-tainted attempts were discarded.
+[^rssmac]: Median of the five repeats (range 4,736–5,102). Phase-1 RSS was
+272 MiB in every repeat.
 
-**Status (through phase 4):** still pending. No real, uncompressed
-`*.NASDAQ_ITCH50` day file is available in this environment, so there is no
-macro row to fill and no book-vs-feed split to compute — that comparison
-awaits the same day file noted in the phase-1 macro row above. No numbers are
-invented here in its place.
+**Default invariant sweeps dominate phase 4's wall time.** The command of
+record inherits `--sweep-every 25000000` → 11 sweeps over the day, and a
+sweep is far more expensive on the phase-4 internals: `check_invariants`
+scans each book's band arrays and bitmaps, and there are 8,892 books —
+~4.2 s per sweep, vs. ~1.0 s per sweep for baseline's node-based structures.
+With `--sweep-every 0` (final sweep only; one clean run each, machine held
+awake): phase 4 replays the day in **38.0 s (7,078,660 msgs/s, 207.3
+MiB/s)** vs. phase 1's **61.7 s (4,357,999 msgs/s, 127.6 MiB/s)** —
+**1.62x**. So the with-sweep table above under-reports the engine: sweeps
+are an out-of-band
+debugging aid (never on the hot path), and with them enabled phase 4
+measures 0.86x vs. baseline end-to-end; without them, 1.62x. Both numbers
+are real consequences of the command of record; the no-sweep pair is the
+fair engine comparison.
+
+**Peak RSS regression (finding):** 272 MiB (baseline) → ~5 GiB (phase 4),
+~18x. Each Book carries fixed-capacity structures — band slot arrays
+(4,096 ticks initial, ×2 growth to 262,144, never shrinking), a 1,024-entry
+minimum open-addressing index, pooled order/level slabs — sized for the
+single hot book of `book_bench`, and the real day multiplies that per-book
+floor by 8,892 books (~575 KiB average per book). Correct, but a real cost
+the micro table never shows; per-book sizing (smaller initial band/index,
+slab sharing across books) is a candidate for a future milestone.
+
+**Book-vs-feed split (spec §2):** feed-dominant. Phase-4 no-sweep
+end-to-end is 141 ns/message; `book_bench steady` (phase 4, new) measures
+the book at 38.7 ns/event — even charging every applied event at the micro
+rate, the book accounts for roughly a quarter of end-to-end wall time, and
+the feed side (framing, decode, routing, stats) for the rest. Per the spec,
+that is a finding for a future milestone, not license to widen this one.
+(Caveat: the micro rate comes from the synthetic single-book `steady`
+workload, so the split is an estimate, not a profile.)
 
 ## Band constants (phase 3 tuning)
 
 `kInitialBandTicks = 4096`, `kMaxBandTicks = 262144` — **still provisional**.
-No real-day `*.NASDAQ_ITCH50` file is available in this environment, so there
-is no per-symbol price-range histogram to tune against, and these constants
-are left unchanged in `src/book.cpp` for this task. They remain a named,
-documented estimate, not a measured one. When a day file becomes available,
-compute the per-symbol quoted-range histogram (share of a symbol's range
-covered by a 262,144-tick window around its first quote) and revisit both
-constants together with the re-anchor question below.
+These constants were set without real-day data and are left unchanged in
+`src/book.cpp`. A day file is now available locally (the macro section's
+`12302019.NASDAQ_ITCH50`), but the tuning itself remains open: compute the
+per-symbol quoted-range histogram (share of a symbol's range covered by a
+262,144-tick window around its first quote) and revisit both constants
+together with the re-anchor question below. The macro RSS finding above adds
+a second input to that tuning: the initial band size is also a per-book
+memory floor paid 8,892 times.
 
 **Review finding, spec-accepted as documentation-only for this phase:** the
 band anchors on the first add for a side (`band_anchor`, `kInitialBandTicks`
