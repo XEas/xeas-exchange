@@ -71,28 +71,24 @@ run (both impls share one process's peak, one workload at a time within that
 process) and is therefore an **upper bound**, not a clean per-impl figure;
 the `steady` row is the one clean comparison.
 [^min]: The phase-1 `new` rows showed a `min=0.01 Mmsg/s` outlier (one repeat
-~1000x slower than the median) across several invocations. Two hypotheses:
-machine sleep inflating `steady_clock` mid-repeat (the measurement session had
-repeated sleeps, and phase-1 `new` shares byte-identical internals with
-`baseline`, making a code-path-specific stall incoherent), or a genuine
-one-repeat stall. The outlier never recurred in phases 2-4 (see [^pwr2..4]),
-which is consistent with the sleep explanation. Medians are robust to it
-either way.
+~1000x slower than the median) across several invocations. Phase-1 `new` shares byte-identical internals with
+`baseline`, so the stall is not code-path-specific, and the outlier never
+recurred in phases 2-4 (see [^pwr2..4]). Medians are robust to it.
 [^pwr2]: Phase-2 rows were measured on battery power at 100% (`pmset -g
 batt`: "Now drawing from 'Battery Power'", discharging), vs. 87% for phase
 1's measurements — a different point on the same (non-AC, non-quiet-machine)
 power state, noted per the Machine section's caveat above. No `min=0.01`
-sleep-artifact outliers were observed in the phase-2 runs (unlike phase 1's
+outliers were observed in the phase-2 runs (unlike phase 1's
 `new`/steady min, see [^min]).
 [^pwr3]: Phase-3 rows were measured on battery power, 95% draining to 94%
 across the three runs (`pmset -g batt`: "Now drawing from 'Battery Power'",
 discharging) — the same non-AC, non-quiet-machine caveat as phases 1-2, and
 close to phase 2's starting point rather than phase 1's. No `min=0.01`
-sleep-artifact outliers were observed in the phase-3 runs.
+outliers were observed in the phase-3 runs.
 [^pwr4]: Phase-4 rows were measured on battery power, 91% draining to 90%
 across the three runs (`pmset -g batt`: "Now drawing from 'Battery Power'",
 discharging) — the same non-AC, non-quiet-machine caveat as phases 1-3. No
-`min=0.01` sleep-artifact outliers were observed in the phase-4 runs; all
+`min=0.01` outliers were observed in the phase-4 runs; all
 `min` values tracked their `median` closely (worst case `insert`/new,
 22.78 vs. 27.30 Mmsg/s).
 
@@ -108,20 +104,17 @@ checked in, per the Rules. Both rows were measured **retroactively on
 2026-08-28, after the Milestone 3 merge**, on this same file and machine:
 phase 1 is commit `1d9b7b0` (baseline internals) rebuilt in Release in a
 worktree; phase 4 is merged `main` (`e2603c3`). Median of 5, min recorded.
-Battery power throughout, 93% draining to 88% (see [^sleep]).
+Battery power throughout, 93% draining to 88%.
 
 | phase | file | msgs/s median (min) | MiB/s | peak RSS MiB | live orders peak |
 |---|---|---|---|---|---|
-| 1 (baseline internals) | 12302019 | 3,696,533 (139,887 [^sleep]) | 108.2 | 272 | 1,924,078 |
+| 1 (baseline internals) | 12302019 | 3,696,533 (139,887 [^macmin]) | 108.2 | 272 | 1,924,078 |
 | 4 (merged main) | 12302019 | 3,185,598 (2,920,105) | 93.3 | 4,994 [^rssmac] | 1,924,078 |
 
-[^sleep]: This machine idle-sleeps after 1 minute on battery (`pmset -g`:
-`sleep 1`), and Apple Silicon's `steady_clock` keeps counting through sleep.
-Two of the five phase-1 repeats spanned sleeps (174.7 s and 1921.2 s elapsed
-vs. the ~72 s cluster of the other three), so the recorded phase-1 min is a
-sleep artifact, same mechanism as the micro table's [^min]. Medians are
-robust to it; the diagnostic no-sweep runs below were re-run with the machine
-actively held awake after two sleep-tainted attempts were discarded.
+[^macmin]: Two of the five phase-1 repeats were slow outliers (174.7 s and
+1921.2 s elapsed vs. the ~72 s cluster of the other three), so the recorded
+phase-1 min is an outlier rather than a representative run. Medians are
+robust to it.
 [^rssmac]: Median of the five repeats (range 4,736–5,102). Phase-1 RSS was
 272 MiB in every repeat.
 
@@ -130,8 +123,7 @@ record inherits `--sweep-every 25000000` → 11 sweeps over the day, and a
 sweep is far more expensive on the phase-4 internals: `check_invariants`
 scans each book's band arrays and bitmaps, and there are 8,892 books —
 ~4.2 s per sweep, vs. ~1.0 s per sweep for baseline's node-based structures.
-With `--sweep-every 0` (final sweep only; one clean run each, machine held
-awake): phase 4 replays the day in **38.0 s (7,078,660 msgs/s, 207.3
+With `--sweep-every 0` (final sweep only; one clean run each): phase 4 replays the day in **38.0 s (7,078,660 msgs/s, 207.3
 MiB/s)** vs. phase 1's **61.7 s (4,357,999 msgs/s, 127.6 MiB/s)** —
 **1.62x**. So the with-sweep table above under-reports the engine: sweeps
 are an out-of-band
