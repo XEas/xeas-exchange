@@ -183,15 +183,3 @@ docs/superpowers/ per-milestone design specs and implementation plans
 DESIGN.md         scope, architecture, key decisions
 BENCH.md          benchmark methodology and full results
 ```
-
-## Status
-
-| Milestone | State |
-|---|---|
-| 1. Book core: data structures, `apply()`, queries, invariant checker | Done |
-| 2. ITCH replay: decode and replay a real trading day | Done |
-| 3. Benchmark and optimize: measured swap to fast internals | Done |
-| 4. Live mode: sequencer and network feed on the same core | Planned, optional |
-
-Out of scope: matching and order entry (this system consumes events, it does
-not match) and multi-threading.
