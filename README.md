@@ -5,6 +5,14 @@ replays NASDAQ TotalView-ITCH 5.0 order-level events (add, cancel, delete,
 execute, replace) and maintains an exact, full-depth replica of every book at
 every point in the day.
 
+An exchange's order book is the list of every resting buy and sell order for a
+stock, sorted by price and then by arrival time. NASDAQ doesn't publish the
+book itself. It publishes the stream of changes (order added, executed,
+cancelled, replaced), about 270 million in one trading day. This engine replays
+that stream and rebuilds every stock's book exactly, so you can see what the
+book looked like at any moment. It mirrors NASDAQ's book. It doesn't match
+orders itself.
+
 The book is pure state and the event stream is the only source of truth, so
 replaying the same events always produces the same book.
 
